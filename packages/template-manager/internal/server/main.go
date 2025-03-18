@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"time"
 
 	artifactregistry "cloud.google.com/go/artifactregistry/apiv1"
@@ -19,11 +21,16 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	e2bgrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc"
 	templatemanager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
 	l "github.com/e2b-dev/infra/packages/shared/pkg/logger"
 	"github.com/e2b-dev/infra/packages/template-manager/internal/constants"
 	"github.com/e2b-dev/infra/packages/template-manager/internal/template"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ecr"
 )
 
 type serverStore struct {
@@ -36,6 +43,7 @@ type serverStore struct {
 	legacyDockerClient *docker.Client
 	artifactRegistry   *artifactregistry.Client
 	templateStorage    *template.Storage
+	ecrClient          *ecr.Client
 }
 
 func New(logger *zap.Logger, buildLogger *zap.Logger) *grpc.Server {
@@ -76,9 +84,31 @@ func New(logger *zap.Logger, buildLogger *zap.Logger) *grpc.Server {
 		panic(err)
 	}
 
-	artifactRegistry, err := artifactregistry.NewClient(ctx)
-	if err != nil {
-		panic(err)
+	var ecrClient *ecr.Client
+	var artifactRegistry *artifactregistry.Client
+
+	if consts.CloudProviderEnv == consts.AWS {
+		region := os.Getenv("AWS_REGION")
+		if region == "" {
+			region = "us-east-1"
+		}
+		cfg, err := loadAWSConfig(ctx, region)
+		if err != nil {
+			panic(err)
+		}
+
+		ecrClient = ecr.NewFromConfig(cfg)
+
+	}
+	if consts.CloudProviderEnv == consts.GCP {
+		artifactRegistry, err = artifactregistry.NewClient(ctx)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	if consts.CloudProviderEnv != consts.AWS && consts.CloudProviderEnv != consts.GCP {
+		panic(fmt.Errorf("unsupported cloud provider: %s", consts.CloudProviderEnv))
 	}
 
 	templateStorage := template.NewStorage(ctx)
@@ -91,8 +121,19 @@ func New(logger *zap.Logger, buildLogger *zap.Logger) *grpc.Server {
 		legacyDockerClient: legacyClient,
 		artifactRegistry:   artifactRegistry,
 		templateStorage:    templateStorage,
+		ecrClient:          ecrClient,
 	})
 
 	grpc_health_v1.RegisterHealthServer(s, health.NewServer())
 	return s
+}
+
+func loadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
+	configOpts := []func(*config.LoadOptions) error{}
+
+	if region != "" {
+		configOpts = append(configOpts, config.WithRegion(region))
+	}
+
+	return config.LoadDefaultConfig(ctx, configOpts...)
 }

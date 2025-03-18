@@ -6,10 +6,11 @@ import (
 	"io"
 	"os"
 
-	"golang.org/x/sync/errgroup"
-
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/gcs"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage/s3"
+	"golang.org/x/sync/errgroup"
 )
 
 type TemplateBuild struct {
@@ -19,6 +20,7 @@ type TemplateBuild struct {
 	rootfsHeader  *header.Header
 
 	bucket *gcs.BucketHandle
+	s3     *s3.BucketHandle
 }
 
 func NewTemplateBuild(
@@ -26,12 +28,21 @@ func NewTemplateBuild(
 	rootfsHeader *header.Header,
 	files *TemplateFiles,
 ) *TemplateBuild {
-	return &TemplateBuild{
-		bucket:        gcs.GetTemplateBucket(),
-		memfileHeader: memfileHeader,
-		rootfsHeader:  rootfsHeader,
-		files:         files,
+	if consts.CloudProviderEnv == consts.AWS {
+		return &TemplateBuild{
+			s3:    s3.GetTemplateBucket(),
+			files: files,
+		}
 	}
+
+	if consts.CloudProviderEnv == consts.GCP {
+		return &TemplateBuild{
+			bucket: gcs.GetTemplateBucket(),
+			files:  files,
+		}
+	}
+
+	panic(fmt.Sprintf("not implemented for cloud provider: %s", consts.CloudProviderEnv))
 }
 
 func (t *TemplateBuild) Remove(ctx context.Context) error {
@@ -60,11 +71,19 @@ func (t *TemplateBuild) uploadMemfileHeader(ctx context.Context, h *header.Heade
 }
 
 func (t *TemplateBuild) uploadMemfile(ctx context.Context, memfilePath string) error {
-	object := gcs.NewObject(ctx, t.bucket, t.files.StorageMemfilePath())
 
-	err := object.UploadWithCli(ctx, memfilePath)
-	if err != nil {
-		return fmt.Errorf("error when uploading memfile: %w", err)
+	if consts.CloudProviderEnv == consts.AWS {
+		fmt.Println("uploading memfile to s3", memfilePath)
+		panic("not implemented")
+	}
+
+	if consts.CloudProviderEnv == consts.GCP {
+		object := gcs.NewObject(ctx, t.bucket, t.files.StorageMemfilePath())
+
+		err := object.UploadWithCli(ctx, memfilePath)
+		if err != nil {
+			return fmt.Errorf("error when uploading memfile: %w", err)
+		}
 	}
 
 	return nil

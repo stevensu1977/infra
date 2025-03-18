@@ -4,13 +4,15 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"go.uber.org/zap"
 	"log"
 	"net"
 	"os"
 
+	"go.uber.org/zap"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/env"
-	"github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
+	sbxlogger "github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
 	"github.com/e2b-dev/infra/packages/template-manager/internal/constants"
 	"github.com/e2b-dev/infra/packages/template-manager/internal/server"
@@ -22,6 +24,9 @@ const defaultPort = 5009
 var commitSHA string
 
 func main() {
+
+	checkCloudProvider()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -89,4 +94,16 @@ func main() {
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
+}
+
+func checkCloudProvider() {
+	if consts.CloudProviderEnv == "" {
+		fmt.Printf("Must set CLOUD_PROVIDER environment variable\n")
+		os.Exit(1)
+	}
+	if consts.CloudProviderEnv != consts.AWS && consts.CloudProviderEnv != consts.GCP {
+		fmt.Printf("unsupported cloud provider: %s\n", consts.CloudProviderEnv)
+		os.Exit(1)
+	}
+	fmt.Printf("CLOUD_PROVIDER: %s\n", consts.CloudProviderEnv)
 }

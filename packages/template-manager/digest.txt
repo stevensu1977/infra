@@ -1,0 +1,2844 @@
+Directory structure:
+└── template-manager/
+    ├── Makefile
+    ├── main.go
+    ├── template-manager.proto
+    ├── upload-envs.sh
+    ├── upload.sh
+    ├── cmd/
+    │   └── build-template/
+    │       └── main.go
+    └── internal/
+        ├── build/
+        │   ├── network_linux.go
+        │   ├── network_other.go
+        │   ├── provision.sh
+        │   ├── rootfs.go
+        │   ├── rootfs_test.go
+        │   ├── snapshot_linux.go
+        │   ├── snapshot_other.go
+        │   ├── tar.go
+        │   ├── template.go
+        │   └── writer/
+        │       └── writer.go
+        ├── constants/
+        │   ├── main.go
+        │   └── service.go
+        ├── server/
+        │   ├── create_template.go
+        │   ├── delete_template.go
+        │   └── main.go
+        ├── template/
+        │   ├── main.go
+        │   └── storage.go
+        └── test/
+            └── build.go
+
+================================================
+File: Makefile
+================================================
+ENV := $(shell cat ../../.last_used_env || echo "not-set")
+-include ../../.env.${ENV}
+
+client := gcloud compute instances list --format='csv(name)' --project $(GCP_PROJECT_ID) | grep "client"
+
+.PHONY: init
+init:
+	brew install protobuf
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2
+
+.PHONY: generate
+generate:
+	# You need to install protobuf (brew install protobuf) and following go packages: protoc-gen-go, protoc-gen-go-grpc
+	# https://grpc.io/docs/languages/go/quickstart/
+	@echo "Generating..."
+	@protoc --go_out=../shared/pkg/grpc/template-manager/ --go_opt=paths=source_relative --go-grpc_out=../shared/pkg/grpc/template-manager/ --go-grpc_opt=paths=source_relative template-manager.proto
+	@echo "Done"
+
+.PHONY: build
+build:
+	# Allow for passing commit sha directly for docker builds
+	$(eval COMMIT_SHA ?= $(shell git rev-parse --short HEAD))
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/template-manager -ldflags "-X=main.commitSHA=$(COMMIT_SHA)"  .
+
+.PHONY: build-debug
+build-debug:
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -race -gcflags=all="-N -l" -o bin/template-manager .
+
+.PHONY: upload
+upload:
+	./upload.sh $(GCP_PROJECT_ID)
+
+.PHONY: build-and-upload
+build-and-upload: build upload
+
+.PHONY: build-template
+build-template:
+	sudo -E TEMPLATE_BUCKET_NAME=$(TEMPLATE_BUCKET_NAME) \
+	GOOGLE_SERVICE_ACCOUNT_BASE64=$(GOOGLE_SERVICE_ACCOUNT_BASE64) \
+	DOCKER_AUTH_BASE64=$(DOCKER_AUTH_BASE64) \
+	GCP_PROJECT_ID=$(GCP_PROJECT_ID) \
+	GCP_DOCKER_REPOSITORY_NAME=$(GCP_DOCKER_REPOSITORY_NAME) \
+	GCP_REGION=$(GCP_REGION) \
+	go run cmd/build-template/main.go \
+	-template $(TEMPLATE_ID) \
+	-build $(BUILD_ID) \
+	-kernel $(KERNEL_VERSION) \
+	-firecracker $(FIRECRACKER_VERSION)
+
+.PHONY: test
+test:
+	go test -v ./...
+
+.PHONY: test-build
+test-build:
+	sudo TEMPLATE_BUCKET_NAME=$(TEMPLATE_BUCKET_NAME) GOOGLE_SERVICE_ACCOUNT_BASE64=$(GOOGLE_SERVICE_ACCOUNT_BASE64) GCP_PROJECT_ID=$(GCP_PROJECT_ID) GCP_DOCKER_REPOSITORY_NAME=$(GCP_DOCKER_REPOSITORY_NAME) GCP_REGION=$(GCP_REGION) go run -race -gcflags=all="-N -l" main.go -test build -template d6a5c9wp4ccm7uqi4jzi -build 8e00bbdf-7f55-4025-9964-eede203c6ee5
+
+.PHONY: test-delete
+test-delete:
+	sudo TEMPLATE_BUCKET_NAME=$(TEMPLATE_BUCKET_NAME) GOOGLE_SERVICE_ACCOUNT_BASE64=$(GOOGLE_SERVICE_ACCOUNT_BASE64) GCP_PROJECT_ID=$(GCP_PROJECT_ID) GCP_DOCKER_REPOSITORY_NAME=$(GCP_DOCKER_REPOSITORY_NAME) GCP_REGION=$(GCP_REGION) go run -race -gcflags=all="-N -l" main.go -test delete -env 0v0c9frk1etrhpxr5ljw
+
+.PHONY: migrate
+migrate:
+	./upload-envs.sh /mnt/disks/fc-envs/v1 $(TEMPLATE_BUCKET_NAME)
+
+
+
+================================================
+File: main.go
+================================================
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"go.uber.org/zap"
+	"log"
+	"net"
+	"os"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/env"
+	"github.com/e2b-dev/infra/packages/shared/pkg/logger/sandbox"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/constants"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/server"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/test"
+)
+
+const defaultPort = 5009
+
+var commitSHA string
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testFlag := flag.String("test", "", "run tests")
+	templateID := flag.String("template", "", "template id")
+	buildID := flag.String("build", "", "build id")
+
+	port := flag.Int("port", defaultPort, "Port for test HTTP server")
+
+	log.Println("Starting template manager", "commit", commitSHA)
+
+	flag.Parse()
+
+	if err := constants.CheckRequired(); err != nil {
+		log.Fatalf("Validation for environment variables failed: %v", err)
+	}
+
+	// If we're running a test, we don't need to start the server
+	if *testFlag != "" {
+		switch *testFlag {
+		case "build":
+			test.Build(*templateID, *buildID)
+			return
+		}
+	}
+
+	if !env.IsLocal() {
+		shutdown := telemetry.InitOTLPExporter(ctx, constants.ServiceName, "no")
+		defer shutdown(context.TODO())
+	}
+
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	logger := sbxlogger.NewLogger(
+		ctx,
+		sbxlogger.SandboxLoggerConfig{
+			ServiceName:      constants.ServiceName,
+			IsInternal:       true,
+			CollectorAddress: os.Getenv("LOGS_COLLECTOR_ADDRESS"),
+		},
+	)
+	defer logger.Sync()
+	sbxlogger.SetSandboxLoggerExternal(logger)
+	zap.ReplaceGlobals(logger)
+
+	// used for logging template build output
+	buildLogger := sbxlogger.NewLogger(
+		ctx,
+		sbxlogger.SandboxLoggerConfig{
+			ServiceName:      constants.ServiceName,
+			IsInternal:       false,
+			CollectorAddress: os.Getenv("LOGS_COLLECTOR_ADDRESS"),
+		},
+	)
+	defer buildLogger.Sync()
+	sbxlogger.SetSandboxLoggerExternal(buildLogger)
+
+	// Create an instance of our handler which satisfies the generated interface
+	s := server.New(logger, buildLogger)
+
+	log.Printf("Starting server on port %d", *port)
+	if err := s.Serve(lis); err != nil {
+		log.Fatalf("failed to serve: %v", err)
+	}
+}
+
+
+
+================================================
+File: template-manager.proto
+================================================
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+
+option go_package = "https://github.com/e2b-dev/infra/template-manager";
+
+
+message TemplateConfig {
+  string templateID = 1;
+  string buildID = 2;
+
+  int32 memoryMB = 3;
+  int32 vCpuCount = 4;
+  int32 diskSizeMB = 5;
+
+  string kernelVersion = 6;
+  string firecrackerVersion = 7;
+  string startCommand = 8;
+  bool hugePages = 9;
+}
+
+message TemplateCreateRequest {
+  TemplateConfig template = 1;
+}
+
+// Data required for deleting a template.
+message TemplateBuildDeleteRequest {
+  string buildID = 1;
+}
+
+// Logs from template build
+message TemplateBuildLog {
+  string log = 1;
+}
+
+// Interface exported by the server.
+service TemplateService {
+  // TemplateCreate is a gRPC service that creates a new template
+  rpc TemplateCreate (TemplateCreateRequest) returns (stream TemplateBuildLog);
+  // TemplateBuildDelete is a gRPC service that deletes files associated with a template build
+  rpc TemplateBuildDelete (TemplateBuildDeleteRequest) returns (google.protobuf.Empty);
+}
+
+
+
+================================================
+File: upload-envs.sh
+================================================
+#!/bin/bash
+
+set -euo pipefail
+
+# -------------------------------------------------------------------------------------------------
+# Upload envs from disk to GCS
+# -------------------------------------------------------------------------------------------------
+# First argument is target dir name
+TARGET_DIR_NAME=$1
+
+# Second argument is template bucket name
+TEMPLATE_BUCKET_NAME=$2
+
+# Third argument is template id that you can specify to upload a specific env
+TEMPLATE_ID=$3
+# -------------------------------------------------------------------------------------------------
+
+echo "Uploading envs from ${TARGET_DIR_NAME} to GCS"
+
+COMMAND="gcloud storage cp --verbosity error -n"
+
+# Initialize counter for uploaded envs
+uploaded_env_count=0
+total_envs=$(ls ${TARGET_DIR_NAME} | wc -l)
+
+# Record the start time
+start_time=$(date +%s)
+
+# iterate over all directories in the target dir
+for template_id in $(ls ${TARGET_DIR_NAME}); do
+  if [ -n "${TEMPLATE_ID}" ] && [ "${template_id}" != "${TEMPLATE_ID}" ]; then
+    continue
+  fi
+
+  # Increment the counter for uploaded envs
+  uploaded_env_count=$((uploaded_env_count + 1))
+
+  echo -e "\n------------------${uploaded_env_count}/${total_envs}-----------------"
+  echo "Uploading env ${template_id}"
+  # Get the build id by printing the content of build_id text file, skip dir if not build_id file exists
+  if [ ! -f "${TARGET_DIR_NAME}/${template_id}/build_id" ]; then
+    echo "Skip ${template_id} because build_id file does not exist"
+    continue
+  fi
+
+  BUILD_ID=$(cat ${TARGET_DIR_NAME}/${template_id}/build_id)
+  echo "Build ID: ${BUILD_ID}"
+
+  # Upload env to GCS via gcloud storage cp, copy only "memfile", "rootfs.ext4" and "snapfile" from the dir
+  # First get and print the paths to the files
+  MEMFILE_PATH=$(ls ${TARGET_DIR_NAME}/${template_id}/memfile)
+  ROOTFS_EXT4_PATH=$(ls ${TARGET_DIR_NAME}/${template_id}/rootfs.ext4)
+  SNAPFILE_PATH=$(ls ${TARGET_DIR_NAME}/${template_id}/snapfile)
+
+  # Check if files exist
+  if [ ! -f "${MEMFILE_PATH}" ]; then
+    echo "Skip ${template_id} because memfile does not exist"
+    continue
+  fi
+
+  if [ ! -f "${ROOTFS_EXT4_PATH}" ]; then
+    echo "Skip ${template_id} because rootfs.ext4 does not exist"
+    continue
+  fi
+
+  if [ ! -f "${SNAPFILE_PATH}" ]; then
+    echo "Skip ${template_id} because snapfile does not exist"
+    continue
+  fi
+
+  BUCKET_MEMFILE_PATH="gs://${TEMPLATE_BUCKET_NAME}/${BUILD_ID}/memfile"
+  BUCKET_ROOTFS_EXT4_PATH="gs://${TEMPLATE_BUCKET_NAME}/${BUILD_ID}/rootfs.ext4"
+  BUCKET_SNAPFILE_PATH="gs://${TEMPLATE_BUCKET_NAME}/${BUILD_ID}/snapfile"
+
+  # Upload the files
+  echo "Uploading memfile"
+  ${COMMAND} ${MEMFILE_PATH} ${BUCKET_MEMFILE_PATH} &
+
+  echo "Uploading rootfs.ext4"
+  ${COMMAND} ${ROOTFS_EXT4_PATH} ${BUCKET_ROOTFS_EXT4_PATH} &
+
+  echo "Uploading snapfile"
+  ${COMMAND} ${SNAPFILE_PATH} ${BUCKET_SNAPFILE_PATH} &
+
+  # Wait for all background jobs to finish
+  wait
+done
+
+# Print the number of uploaded envs
+echo "Total number of uploaded envs: ${uploaded_env_count}"
+
+# Record the end time
+end_time=$(date +%s)
+
+# Calculate and print the elapsed time
+elapsed_time=$((end_time - start_time))
+echo "Total elapsed time: ${elapsed_time} seconds"
+
+
+
+================================================
+File: upload.sh
+================================================
+#!/bin/bash
+
+set -euo pipefail
+
+GCP_PROJECT_ID=$1
+
+chmod +x bin/template-manager
+
+gsutil -h "Cache-Control:no-cache, max-age=0" \
+  cp bin/template-manager "gs://${GCP_PROJECT_ID}-fc-env-pipeline/template-manager"
+
+
+
+================================================
+File: cmd/build-template/main.go
+================================================
+package main
+
+import (
+	"bytes"
+	"context"
+	"flag"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/docker/docker/client"
+	docker "github.com/fsouza/go-dockerclient"
+	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/build"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/template"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	templateID := flag.String("template", "", "template id")
+	buildID := flag.String("build", "", "build id")
+	kernelVersion := flag.String("kernel", "", "kernel version")
+	fcVersion := flag.String("firecracker", "", "firecracker version")
+	flag.Parse()
+
+	err := Build(ctx, *kernelVersion, *fcVersion, *templateID, *buildID)
+	if err != nil {
+		log.Fatal().Err(err).Msg("error building template")
+		os.Exit(1)
+	}
+}
+
+func Build(ctx context.Context, kernelVersion, fcVersion, templateID, buildID string) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute*3)
+	defer cancel()
+
+	tracer := otel.Tracer("test")
+
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+
+	legacyClient, err := docker.NewClientFromEnv()
+	if err != nil {
+		return err
+	}
+
+	var buf bytes.Buffer
+	t := build.Env{
+		TemplateFiles: storage.NewTemplateFiles(
+			templateID,
+			buildID,
+			kernelVersion,
+			fcVersion,
+			true,
+		),
+		VCpuCount:       2,
+		MemoryMB:        256,
+		StartCmd:        "",
+		DiskSizeMB:      512,
+		BuildLogsWriter: &buf,
+	}
+
+	err = t.Build(ctx, tracer, dockerClient, legacyClient)
+	if err != nil {
+		return fmt.Errorf("error building template: %w", err)
+	}
+
+	tempStorage := template.NewStorage(ctx)
+
+	buildStorage := tempStorage.NewBuild(t.TemplateFiles)
+
+	memfilePath := t.BuildMemfilePath()
+	rootfsPath := t.BuildRootfsPath()
+
+	upload := buildStorage.Upload(
+		ctx,
+		t.BuildSnapfilePath(),
+		&memfilePath,
+		&rootfsPath,
+	)
+
+	err = <-upload
+	if err != nil {
+		return fmt.Errorf("error uploading build: %w", err)
+	}
+
+	return nil
+}
+
+
+
+================================================
+File: internal/build/network_linux.go
+================================================
+//go:build linux
+// +build linux
+
+package build
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"runtime"
+
+	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+)
+
+const (
+	fcTapAddress        = "169.254.0.22"
+	fcTapMask           = "30"
+	fcTapName           = "tap0"
+	namespaceNamePrefix = "fc-env-"
+)
+
+var fcTapCIDR = fmt.Sprintf("%s/%s", fcTapAddress, fcTapMask)
+
+type FCNetwork struct {
+	namespaceID string
+}
+
+func NewFCNetwork(ctx context.Context, tracer trace.Tracer, env *Env) (*FCNetwork, error) {
+	childCtx, childSpan := tracer.Start(ctx, "new-fc-network")
+	defer childSpan.End()
+
+	network := &FCNetwork{
+		namespaceID: namespaceNamePrefix + env.BuildId,
+	}
+
+	err := network.setup(childCtx, tracer)
+	if err != nil {
+		errMsg := fmt.Errorf("error setting up network: %w", err)
+
+		network.Cleanup(childCtx, tracer)
+
+		return nil, errMsg
+	}
+
+	return network, err
+}
+
+func (n *FCNetwork) setup(ctx context.Context, tracer trace.Tracer) error {
+	childCtx, childSpan := tracer.Start(ctx, "setup")
+	defer childSpan.End()
+
+	// Prevent thread changes so the we can safely manipulate with namespaces
+	telemetry.ReportEvent(childCtx, "waiting for OS thread lock")
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	telemetry.ReportEvent(childCtx, "OS thread lock passed")
+
+	// Save the original (host) namespace and restore it upon function exit
+	hostNS, err := netns.Get()
+	if err != nil {
+		errMsg := fmt.Errorf("cannot get current (host) namespace: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "saved original ns")
+
+	defer func() {
+		netErr := netns.Set(hostNS)
+		if netErr != nil {
+			errMsg := fmt.Errorf("error resetting network namespace back to the host namespace: %w", netErr)
+			telemetry.ReportError(childCtx, errMsg)
+		} else {
+			telemetry.ReportEvent(childCtx, "reset network namespace back to the host namespace")
+		}
+
+		netErr = hostNS.Close()
+		if netErr != nil {
+			errMsg := fmt.Errorf("error closing host network namespace: %w", netErr)
+			telemetry.ReportError(childCtx, errMsg)
+		} else {
+			telemetry.ReportEvent(childCtx, "closed host network namespace")
+		}
+	}()
+
+	// Create namespace
+	ns, err := netns.NewNamed(n.namespaceID)
+	if err != nil {
+		errMsg := fmt.Errorf("cannot create new namespace: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "created ns")
+
+	defer func() {
+		nsErr := ns.Close()
+		if nsErr != nil {
+			errMsg := fmt.Errorf("error closing namespace: %w", nsErr)
+			telemetry.ReportError(childCtx, errMsg)
+		} else {
+			telemetry.ReportEvent(childCtx, "closed namespace")
+		}
+	}()
+
+	// Create tap device
+	tapAttrs := netlink.NewLinkAttrs()
+	tapAttrs.Name = fcTapName
+	tapAttrs.Namespace = ns
+
+	tap := &netlink.Tuntap{
+		Mode:      netlink.TUNTAP_MODE_TAP,
+		LinkAttrs: tapAttrs,
+	}
+
+	err = netlink.LinkAdd(tap)
+	if err != nil {
+		errMsg := fmt.Errorf("error creating tap device: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "created tap device")
+
+	// Active tap device
+	err = netlink.LinkSetUp(tap)
+	if err != nil {
+		errMsg := fmt.Errorf("error setting tap device up: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "set tap device up")
+
+	// Add ip address to tap device
+	ip, ipNet, err := net.ParseCIDR(fcTapCIDR)
+	if err != nil {
+		errMsg := fmt.Errorf("error parsing tap CIDR: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "parsed CIDR")
+
+	err = netlink.AddrAdd(tap, &netlink.Addr{
+		IPNet: &net.IPNet{
+			IP:   ip,
+			Mask: ipNet.Mask,
+		},
+	})
+	if err != nil {
+		errMsg := fmt.Errorf("error setting address of the tap device: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "set tap device address")
+
+	return nil
+}
+
+func (n *FCNetwork) Cleanup(ctx context.Context, tracer trace.Tracer) {
+	childCtx, childSpan := tracer.Start(ctx, "cleanup")
+	defer childSpan.End()
+
+	err := netns.DeleteNamed(n.namespaceID)
+	if err != nil {
+		errMsg := fmt.Errorf("error deleting namespace: %w", err)
+		telemetry.ReportError(childCtx, errMsg)
+	} else {
+		telemetry.ReportEvent(childCtx, "deleted namespace")
+	}
+}
+
+
+
+================================================
+File: internal/build/network_other.go
+================================================
+//go:build !linux
+// +build !linux
+
+package build
+
+import (
+	"context"
+	"fmt"
+
+	"go.opentelemetry.io/otel/trace"
+)
+
+type FCNetwork struct {
+	namespaceID string
+}
+
+// Cleanup is a no-op for non-Linux systems
+func (n *FCNetwork) Cleanup(ctx context.Context, tracer trace.Tracer) {
+}
+
+// NewFCNetwork returns an error
+func NewFCNetwork(ctx context.Context, tracer trace.Tracer, env *Env) (*FCNetwork, error) {
+	return nil, fmt.Errorf("network functionality is only supported on Linux")
+}
+
+
+
+================================================
+File: internal/build/provision.sh
+================================================
+export BASH_XTRACEFD=1
+set -euo xtrace pipefail
+
+echo "Starting provisioning script."
+
+echo "ENV_ID={{ .EnvID }}" >/.e2b
+echo "BUILD_ID={{ .BuildID }}" >>/.e2b
+
+# We are downloading the packages manually
+apt-get update --download-only
+DEBIAN_FRONTEND=noninteractive DEBCONF_NOWARNINGS=yes apt-get install -y openssh-server sudo systemd socat chrony linuxptp iptables
+
+# Set up autologin.
+mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d
+cat <<EOF >/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --noissue --autologin root %I 115200,38400,9600 vt102
+EOF
+
+# Add swapfile — we enable it in the preexec for envd
+mkdir /swap
+fallocate -l 128M /swap/swapfile
+chmod 600 /swap/swapfile
+mkswap /swap/swapfile
+
+# Set up envd service.
+mkdir -p /etc/systemd/system
+cat <<EOF >/etc/systemd/system/envd-v0.0.1.service
+[Unit]
+Description=Env v0.0.1 Daemon Service
+
+[Service]
+Type=simple
+Restart=always
+User=root
+Group=root
+Environment=GOTRACEBACK=all
+LimitCORE=infinity
+ExecStart=/bin/bash -l -c "/usr/bin/envd-v0.0.1"
+OOMPolicy=continue
+OOMScoreAdjust=-1000
+Environment="GOMEMLIMIT={{ .MemoryLimit }}MiB"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Set up e2bd service.
+cat <<EOF >/etc/systemd/system/envd.service
+[Unit]
+Description=Env Daemon Service
+
+[Service]
+Type=simple
+Restart=always
+User=root
+Group=root
+Environment=GOTRACEBACK=all
+LimitCORE=infinity
+ExecStart=/bin/bash -l -c "/usr/bin/envd -cmd '{{ .StartCmd }}'"
+OOMPolicy=continue
+OOMScoreAdjust=-1000
+Environment="GOMEMLIMIT={{ .MemoryLimit }}MiB"
+
+ExecStartPre=/bin/bash -c 'echo 0 > /proc/sys/vm/swappiness && swapon /swap/swapfile'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Set up chrony.
+mkdir -p /etc/chrony
+cat <<EOF >/etc/chrony/chrony.conf
+refclock PHC /dev/ptp0 poll -1 dpoll -1 offset 0 trust prefer
+makestep 1 -1
+EOF
+
+# Add a proxy config, as some environments expects it there (e.g. timemaster in Node Dockerimage)
+echo "include /etc/chrony/chrony.conf" >/etc/chrony.conf
+
+mkdir -p /etc/systemd/system/chrony.service.d
+# The ExecStart= should be emptying the ExecStart= line in config.
+cat <<EOF >/etc/systemd/system/chrony.service.d/override.conf
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/chronyd
+User=root
+Group=root
+EOF
+
+# Enable systemd services
+# Because this script runs in a container we can't use `systemctl`.
+# Containers don't run init daemons. We have to enable the runner service manually.
+mkdir -p /etc/systemd/system/multi-user.target.wants
+ln -s /etc/systemd/system/envd.service /etc/systemd/system/multi-user.target.wants/envd.service
+ln -s /etc/systemd/system/envd-v0.0.1.service /etc/systemd/system/multi-user.target.wants/envd-v0.0.1.service
+
+# Set up shell.
+echo "export SHELL='/bin/bash'" >/etc/profile.d/shell.sh
+echo "export PS1='\w \$ '" >/etc/profile.d/prompt.sh
+echo "export PS1='\w \$ '" >>"/etc/profile"
+echo "export PS1='\w \$ '" >>"/root/.bashrc"
+
+# Use .bashrc and .profile
+echo "if [ -f ~/.bashrc ]; then source ~/.bashrc; fi; if [ -f ~/.profile ]; then source ~/.profile; fi" >>/etc/profile
+
+# Set up SSH.
+mkdir -p /etc/ssh
+cat <<EOF >>/etc/ssh/sshd_config
+PermitRootLogin yes
+PermitEmptyPasswords yes
+PasswordAuthentication yes
+EOF
+
+# Remove password for root.
+passwd -d root
+
+# Create default user.
+adduser --disabled-password --gecos "" user
+usermod -aG sudo user
+passwd -d user
+echo "user ALL=(ALL:ALL) NOPASSWD: ALL" >>/etc/sudoers
+
+mkdir -p /code
+mkdir -p /home/user
+
+chmod 777 -R /home/user
+chmod 777 -R /usr/local
+chmod 777 -R /code
+
+# TODO: Right now the chown line has no effect in the FC, even though it correctly changes the owner here.
+# It may be because of the way we are starting the FC VM?
+
+# Add DNS.
+echo "nameserver 8.8.8.8" >/etc/resolv.conf
+
+# Start systemd services
+systemctl enable envd
+systemctl enable envd-v0.0.1
+systemctl enable chrony 2>&1
+
+cat <<EOF >/etc/systemd/system/forward_ports.service
+[Unit]
+Description=Forward Ports Service
+
+[Service]
+Type=simple
+Restart=no
+User=root
+Group=root
+ExecStart=/bin/bash -l -c "(echo 1 | tee /proc/sys/net/ipv4/ip_forward) && iptables-legacy -t nat -A POSTROUTING -s 127.0.0.1 -j SNAT --to-source {{ .FcAddress }} && iptables-legacy -t nat -A PREROUTING -d {{ .FcAddress }} -j DNAT --to-destination 127.0.0.1"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# systemctl enable forward_ports
+
+echo "Finished provisioning script"
+
+
+
+================================================
+File: internal/build/rootfs.go
+================================================
+package build
+
+import (
+	"archive/tar"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/Microsoft/hcsshim/ext4/tar2ext4"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/registry"
+	"github.com/docker/docker/client"
+	docker "github.com/fsouza/go-dockerclient"
+	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+)
+
+const (
+	ToMBShift = 20
+	// Max size of the rootfs file in MB.
+	maxRootfsSize = 15000 << ToMBShift
+	cacheTimeout  = "48h"
+)
+
+var authConfig = registry.AuthConfig{
+	Username: "_json_key_base64",
+	Password: consts.GoogleServiceAccountSecret,
+}
+
+type Rootfs struct {
+	client       *client.Client
+	legacyClient *docker.Client
+
+	env *Env
+}
+
+type MultiWriter struct {
+	writers []io.Writer
+}
+
+func (mw *MultiWriter) Write(p []byte) (int, error) {
+	for _, writer := range mw.writers {
+		_, err := writer.Write(p)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	return len(p), nil
+}
+
+func NewRootfs(ctx context.Context, tracer trace.Tracer, env *Env, docker *client.Client, legacyDocker *docker.Client) (*Rootfs, error) {
+	childCtx, childSpan := tracer.Start(ctx, "new-rootfs")
+	defer childSpan.End()
+
+	rootfs := &Rootfs{
+		client:       docker,
+		legacyClient: legacyDocker,
+		env:          env,
+	}
+
+	_, _ = env.BuildLogsWriter.Write([]byte("Pulling Docker image...\n"))
+	err := rootfs.pullDockerImage(childCtx, tracer)
+	if err != nil {
+		errMsg := fmt.Errorf("error building docker image: %w", err)
+
+		rootfs.cleanupDockerImage(childCtx, tracer)
+
+		return nil, errMsg
+	}
+	_, _ = env.BuildLogsWriter.Write([]byte("Pulled Docker image.\n"))
+
+	err = rootfs.createRootfsFile(childCtx, tracer)
+	if err != nil {
+		errMsg := fmt.Errorf("error creating rootfs file: %w", err)
+
+		rootfs.cleanupDockerImage(childCtx, tracer)
+
+		return nil, errMsg
+	}
+
+	return rootfs, nil
+}
+
+func (r *Rootfs) pullDockerImage(ctx context.Context, tracer trace.Tracer) error {
+	childCtx, childSpan := tracer.Start(ctx, "pull-docker-image")
+	defer childSpan.End()
+
+	authConfigBytes, err := json.Marshal(authConfig)
+	if err != nil {
+		errMsg := fmt.Errorf("error marshaling auth config: %w", err)
+
+		return errMsg
+	}
+
+	authConfigBase64 := base64.URLEncoding.EncodeToString(authConfigBytes)
+	if consts.DockerAuthConfig != "" {
+		authConfigBase64 = consts.DockerAuthConfig
+	}
+
+	logs, err := r.client.ImagePull(childCtx, r.dockerTag(), image.PullOptions{
+		RegistryAuth: authConfigBase64,
+		Platform:     "linux/amd64",
+	})
+	if err != nil {
+		errMsg := fmt.Errorf("error pulling image: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	_, err = io.Copy(os.Stdout, logs)
+	if err != nil {
+		errMsg := fmt.Errorf("error copying logs: %w", err)
+		telemetry.ReportError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	err = logs.Close()
+	if err != nil {
+		errMsg := fmt.Errorf("error closing logs: %w", err)
+		telemetry.ReportError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "pulled image")
+
+	return nil
+}
+
+func (r *Rootfs) cleanupDockerImage(ctx context.Context, tracer trace.Tracer) {
+	childCtx, childSpan := tracer.Start(ctx, "cleanup-docker-image")
+	defer childSpan.End()
+
+	_, err := r.client.ImageRemove(childCtx, r.dockerTag(), image.RemoveOptions{
+		Force:         false,
+		PruneChildren: false,
+	})
+	if err != nil {
+		errMsg := fmt.Errorf("error removing image: %w", err)
+		telemetry.ReportError(childCtx, errMsg)
+	} else {
+		telemetry.ReportEvent(childCtx, "removed image")
+	}
+}
+
+func (r *Rootfs) dockerTag() string {
+	return fmt.Sprintf("%s-docker.pkg.dev/%s/%s/%s:%s", consts.GCPRegion, consts.GCPProject, consts.DockerRegistry, r.env.TemplateId, r.env.BuildId)
+}
+
+type PostProcessor struct {
+	errChan chan error
+	ctx     context.Context
+	writer  io.Writer
+}
+
+// Start starts the post-processing.
+func (p *PostProcessor) Start() {
+	p.writer.Write([]byte(fmt.Sprintf("[%s] Start postprocessing\n", time.Now().Format(time.RFC3339))))
+
+	for {
+		msg := []byte(fmt.Sprintf("[%s] Postprocessing\n", time.Now().Format(time.RFC3339)))
+
+		select {
+		case postprocessingErr := <-p.errChan:
+			if postprocessingErr != nil {
+				p.writer.Write([]byte(fmt.Sprintf("[%s] Postprocessing failed: %s\n", time.Now().Format(time.RFC3339), postprocessingErr)))
+				return
+			}
+
+			p.writer.Write(msg)
+			p.writer.Write([]byte(fmt.Sprintf("[%s] Postprocessing finished.\n", time.Now().Format(time.RFC3339))))
+
+			return
+		case <-p.ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+			p.writer.Write(msg)
+		}
+	}
+
+}
+
+func (p *PostProcessor) stop(err error) {
+	p.errChan <- err
+}
+
+func NewPostProcessor(ctx context.Context, writer io.Writer) *PostProcessor {
+	return &PostProcessor{
+		ctx:     ctx,
+		writer:  writer,
+		errChan: make(chan error),
+	}
+}
+
+func (r *Rootfs) createRootfsFile(ctx context.Context, tracer trace.Tracer) error {
+	childCtx, childSpan := tracer.Start(ctx, "create-rootfs-file")
+	defer childSpan.End()
+
+	var err error
+	PostProcessor := NewPostProcessor(childCtx, r.env.BuildLogsWriter)
+	go PostProcessor.Start()
+	defer PostProcessor.stop(err)
+
+	var scriptDef bytes.Buffer
+
+	err = EnvInstanceTemplate.Execute(&scriptDef, struct {
+		EnvID       string
+		BuildID     string
+		StartCmd    string
+		FcAddress   string
+		MemoryLimit int
+	}{
+		FcAddress:   fcAddr,
+		EnvID:       r.env.TemplateId,
+		BuildID:     r.env.BuildId,
+		StartCmd:    strings.ReplaceAll(r.env.StartCmd, "'", "\\'"),
+		MemoryLimit: int(math.Min(float64(r.env.MemoryMB)/2, 512)),
+	})
+	if err != nil {
+		errMsg := fmt.Errorf("error executing provision script: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "executed provision script env")
+
+	if err != nil {
+		errMsg := fmt.Errorf("error generating network name: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "created network")
+
+	pidsLimit := int64(200)
+
+	cont, err := r.client.ContainerCreate(childCtx, &container.Config{
+		Image:        r.dockerTag(),
+		Entrypoint:   []string{"/bin/bash", "-c"},
+		User:         "root",
+		Cmd:          []string{scriptDef.String()},
+		Tty:          false,
+		AttachStdout: true,
+		AttachStderr: true,
+	}, &container.HostConfig{
+		SecurityOpt: []string{"no-new-privileges"},
+		CapAdd:      []string{"CHOWN", "DAC_OVERRIDE", "FSETID", "FOWNER", "SETGID", "SETUID", "NET_RAW", "SYS_CHROOT"},
+		CapDrop:     []string{"ALL"},
+		// TODO: Network mode is causing problems with /etc/hosts - we want to find a way to fix this and enable network mode again
+		// NetworkMode: container.NetworkMode(network.ID),
+		Resources: container.Resources{
+			Memory:     r.env.MemoryMB << ToMBShift,
+			CPUPeriod:  100000,
+			CPUQuota:   r.env.VCpuCount * 100000,
+			MemorySwap: r.env.MemoryMB << ToMBShift,
+			PidsLimit:  &pidsLimit,
+		},
+	}, nil, &v1.Platform{}, "")
+	if err != nil {
+		errMsg := fmt.Errorf("error creating container: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "created container")
+
+	defer func() {
+		go func() {
+			cleanupContext, cleanupSpan := tracer.Start(
+				trace.ContextWithSpanContext(context.Background(), childSpan.SpanContext()),
+				"cleanup-container",
+			)
+			defer cleanupSpan.End()
+
+			removeErr := r.legacyClient.RemoveContainer(docker.RemoveContainerOptions{
+				ID:            cont.ID,
+				RemoveVolumes: true,
+				Force:         true,
+				Context:       cleanupContext,
+			})
+			if removeErr != nil {
+				errMsg := fmt.Errorf("error removing container: %w", removeErr)
+				telemetry.ReportError(cleanupContext, errMsg)
+			} else {
+				telemetry.ReportEvent(cleanupContext, "removed container")
+			}
+
+			// Move pruning to separate goroutine
+			cacheTimeoutArg := filters.Arg("until", cacheTimeout)
+
+			_, pruneErr := r.client.BuildCachePrune(cleanupContext, types.BuildCachePruneOptions{
+				Filters: filters.NewArgs(cacheTimeoutArg),
+				All:     true,
+			})
+			if pruneErr != nil {
+				errMsg := fmt.Errorf("error pruning build cache: %w", pruneErr)
+				telemetry.ReportError(cleanupContext, errMsg)
+			} else {
+				telemetry.ReportEvent(cleanupContext, "pruned build cache")
+			}
+
+			_, pruneErr = r.client.ImagesPrune(cleanupContext, filters.NewArgs(cacheTimeoutArg))
+			if pruneErr != nil {
+				errMsg := fmt.Errorf("error pruning images: %w", pruneErr)
+				telemetry.ReportError(cleanupContext, errMsg)
+			} else {
+				telemetry.ReportEvent(cleanupContext, "pruned images")
+			}
+
+			_, pruneErr = r.client.ContainersPrune(cleanupContext, filters.NewArgs(cacheTimeoutArg))
+			if pruneErr != nil {
+				errMsg := fmt.Errorf("error pruning containers: %w", pruneErr)
+				telemetry.ReportError(cleanupContext, errMsg)
+			} else {
+				telemetry.ReportEvent(cleanupContext, "pruned containers")
+			}
+		}()
+	}()
+
+	filesToTar := []fileToTar{
+		{
+			localPath: storage.HostOldEnvdPath,
+			tarPath:   storage.GuestOldEnvdPath,
+		},
+		{
+			localPath: storage.HostEnvdPath,
+			tarPath:   storage.GuestEnvdPath,
+		},
+	}
+
+	pr, pw := io.Pipe()
+
+	go func() {
+		var errMsg error
+		defer func() {
+			closeErr := pw.CloseWithError(errMsg)
+			if closeErr != nil {
+				errMsg := fmt.Errorf("error closing pipe: %w", closeErr)
+				telemetry.ReportCriticalError(childCtx, errMsg)
+			} else {
+				telemetry.ReportEvent(childCtx, "closed pipe")
+			}
+		}()
+
+		tw := tar.NewWriter(pw)
+		defer func() {
+			err = tw.Close()
+			if err != nil {
+				errMsg = fmt.Errorf("error closing tar writer: %w", errors.Join(err, errMsg))
+				telemetry.ReportCriticalError(childCtx, errMsg)
+			} else {
+				telemetry.ReportEvent(childCtx, "closed tar writer")
+			}
+		}()
+
+		for _, file := range filesToTar {
+			addErr := addFileToTarWriter(tw, file)
+			if addErr != nil {
+				errMsg = fmt.Errorf("error adding envd to tar writer: %w", addErr)
+				telemetry.ReportCriticalError(childCtx, errMsg)
+
+				break
+			} else {
+				telemetry.ReportEvent(childCtx, "added envd to tar writer")
+			}
+		}
+	}()
+
+	// Copy tar to the container
+	err = r.legacyClient.UploadToContainer(cont.ID, docker.UploadToContainerOptions{
+		InputStream:          pr,
+		Path:                 "/",
+		Context:              childCtx,
+		NoOverwriteDirNonDir: false,
+	})
+	if err != nil {
+		errMsg := fmt.Errorf("error copying envd to container: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "copied envd to container")
+
+	err = r.client.ContainerStart(childCtx, cont.ID, container.StartOptions{})
+	if err != nil {
+		errMsg := fmt.Errorf("error starting container: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "started container")
+
+	go func() {
+		anonymousChildCtx, anonymousChildSpan := tracer.Start(childCtx, "handle-container-logs", trace.WithSpanKind(trace.SpanKindConsumer))
+		defer anonymousChildSpan.End()
+
+		containerStdoutWriter := telemetry.NewEventWriter(anonymousChildCtx, "stdout")
+		containerStderrWriter := telemetry.NewEventWriter(anonymousChildCtx, "stderr")
+
+		writer := &MultiWriter{
+			writers: []io.Writer{containerStderrWriter, r.env.BuildLogsWriter},
+		}
+
+		logsErr := r.legacyClient.Logs(docker.LogsOptions{
+			Stdout:       true,
+			Stderr:       true,
+			RawTerminal:  false,
+			OutputStream: containerStdoutWriter,
+			ErrorStream:  writer,
+			Context:      childCtx,
+			Container:    cont.ID,
+			Follow:       true,
+			Timestamps:   false,
+		})
+		if logsErr != nil {
+			errMsg := fmt.Errorf("error getting container logs: %w", logsErr)
+			telemetry.ReportError(anonymousChildCtx, errMsg)
+		} else {
+			telemetry.ReportEvent(anonymousChildCtx, "setup container logs")
+		}
+	}()
+
+	wait, errWait := r.client.ContainerWait(childCtx, cont.ID, container.WaitConditionNotRunning)
+	select {
+	case <-childCtx.Done():
+		errMsg := fmt.Errorf("error waiting for container: %w", childCtx.Err())
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	case waitErr := <-errWait:
+		if waitErr != nil {
+			errMsg := fmt.Errorf("error waiting for container: %w", waitErr)
+			telemetry.ReportCriticalError(childCtx, errMsg)
+
+			return errMsg
+		}
+	case response := <-wait:
+		if response.Error != nil {
+			errMsg := fmt.Errorf("error waiting for container - code %d: %s", response.StatusCode, response.Error.Message)
+			telemetry.ReportCriticalError(childCtx, errMsg)
+
+			return errMsg
+		}
+	}
+
+	telemetry.ReportEvent(childCtx, "waited for container exit")
+
+	inspection, err := r.client.ContainerInspect(ctx, cont.ID)
+	if err != nil {
+		errMsg := fmt.Errorf("error inspecting container: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "inspected container")
+
+	if inspection.State.Running {
+		errMsg := fmt.Errorf("container is still running")
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	if inspection.State.ExitCode != 0 {
+		errMsg := fmt.Errorf("container exited with status %d: %s", inspection.State.ExitCode, inspection.State.Error)
+		telemetry.ReportCriticalError(
+			childCtx,
+			errMsg,
+			attribute.Int("exit_code", inspection.State.ExitCode),
+			attribute.String("error", inspection.State.Error),
+			attribute.Bool("oom", inspection.State.OOMKilled),
+		)
+
+		return errMsg
+	}
+
+	rootfsFile, err := os.Create(r.env.BuildRootfsPath())
+	if err != nil {
+		errMsg := fmt.Errorf("error creating rootfs file: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "created rootfs file")
+
+	defer func() {
+		rootfsErr := rootfsFile.Close()
+		if rootfsErr != nil {
+			errMsg := fmt.Errorf("error closing rootfs file: %w", rootfsErr)
+			telemetry.ReportError(childCtx, errMsg)
+		} else {
+			telemetry.ReportEvent(childCtx, "closed rootfs file")
+		}
+	}()
+
+	pr, pw = io.Pipe()
+
+	go func() {
+		downloadErr := r.legacyClient.DownloadFromContainer(cont.ID, docker.DownloadFromContainerOptions{
+			Context:      childCtx,
+			Path:         "/",
+			OutputStream: pw,
+		})
+		if downloadErr != nil {
+			errMsg := fmt.Errorf("error downloading from container: %w", downloadErr)
+			telemetry.ReportCriticalError(childCtx, errMsg)
+		} else {
+			telemetry.ReportEvent(childCtx, "downloaded from container")
+		}
+
+		closeErr := pw.Close()
+		if closeErr != nil {
+			errMsg := fmt.Errorf("error closing pipe: %w", closeErr)
+			telemetry.ReportCriticalError(childCtx, errMsg)
+		} else {
+			telemetry.ReportEvent(childCtx, "closed pipe")
+		}
+	}()
+
+	telemetry.ReportEvent(childCtx, "coverting tar to ext4")
+
+	// This package creates a read-only ext4 filesystem from a tar archive.
+	// We need to use another program to make the filesystem writable.
+	err = tar2ext4.ConvertTarToExt4(pr, rootfsFile, tar2ext4.MaximumDiskSize(maxRootfsSize))
+	if err != nil {
+		if strings.Contains(err.Error(), "disk exceeded maximum size") {
+			r.env.BuildLogsWriter.Write([]byte(fmt.Sprintf("Build failed - exceeded maximum size %v MB.\n", maxRootfsSize>>ToMBShift)))
+		}
+
+		errMsg := fmt.Errorf("error converting tar to ext4: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "converted container tar to ext4")
+
+	tuneContext, tuneSpan := tracer.Start(childCtx, "tune-rootfs-file-cmd")
+	defer tuneSpan.End()
+
+	cmd := exec.CommandContext(tuneContext, "tune2fs", "-O ^read-only", r.env.BuildRootfsPath())
+
+	tuneStdoutWriter := telemetry.NewEventWriter(tuneContext, "stdout")
+	cmd.Stdout = tuneStdoutWriter
+
+	tuneStderrWriter := telemetry.NewEventWriter(childCtx, "stderr")
+	cmd.Stderr = tuneStderrWriter
+
+	err = cmd.Run()
+	if err != nil {
+		errMsg := fmt.Errorf("error making rootfs file writable: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "made rootfs file writable")
+
+	rootfsStats, err := rootfsFile.Stat()
+	if err != nil {
+		errMsg := fmt.Errorf("error statting rootfs file: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "statted rootfs file")
+
+	// In bytes
+	rootfsSize := rootfsStats.Size() + r.env.DiskSizeMB<<ToMBShift
+
+	r.env.rootfsSize = rootfsSize
+
+	err = rootfsFile.Truncate(rootfsSize)
+	if err != nil {
+		errMsg := fmt.Errorf("error truncating rootfs file: %w to size of build + defaultDiskSizeMB", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "truncated rootfs file to size of build + defaultDiskSizeMB")
+
+	resizeContext, resizeSpan := tracer.Start(childCtx, "resize-rootfs-file-cmd")
+	defer resizeSpan.End()
+
+	cmd = exec.CommandContext(resizeContext, "resize2fs", r.env.BuildRootfsPath())
+
+	resizeStdoutWriter := telemetry.NewEventWriter(resizeContext, "stdout")
+	cmd.Stdout = resizeStdoutWriter
+
+	resizeStderrWriter := telemetry.NewEventWriter(resizeContext, "stderr")
+	cmd.Stderr = resizeStderrWriter
+
+	err = cmd.Run()
+	if err != nil {
+		errMsg := fmt.Errorf("error resizing rootfs file: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "resized rootfs file")
+
+	return nil
+}
+
+
+
+================================================
+File: internal/build/rootfs_test.go
+================================================
+package build
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// test writer that stores the written data
+type testWriter struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (w *testWriter) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.data = append(w.data, p...)
+	return len(p), nil
+}
+
+func TestPostProcessor_Start(t *testing.T) {
+	type fields struct {
+		testErr       error
+		shouldContain string
+	}
+	tests := []struct {
+		name   string
+		fields fields
+	}{
+		{
+			name: "test error",
+			fields: fields{
+				testErr:       errors.New("test error"),
+				shouldContain: "Postprocessing failed:",
+			},
+		},
+		{
+			name: "test success",
+			fields: fields{
+				testErr:       nil,
+				shouldContain: "Postprocessing finished.",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			tw := &testWriter{}
+			ctx := context.TODO()
+			errChan := make(chan error)
+
+			p := &PostProcessor{
+				ctx:     ctx,
+				writer:  tw,
+				errChan: errChan,
+			}
+			go p.Start()
+			p.stop(tt.fields.testErr)
+			close(errChan)
+
+			if !strings.Contains(string(tw.data), tt.fields.shouldContain) {
+				t.Errorf("expected data to contain %s, got %s", tt.fields.shouldContain, string(tw.data))
+			}
+
+		})
+	}
+}
+
+
+
+================================================
+File: internal/build/snapshot_linux.go
+================================================
+//go:build linux
+// +build linux
+
+package build
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/firecracker-microvm/firecracker-go-sdk"
+	"github.com/go-openapi/strfmt"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/fc/client"
+	"github.com/e2b-dev/infra/packages/shared/pkg/fc/client/operations"
+	"github.com/e2b-dev/infra/packages/shared/pkg/fc/models"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+)
+
+const (
+	fcMaskLong   = "255.255.255.252"
+	fcMacAddress = "02:FC:00:00:00:05"
+	fcAddr       = "169.254.0.21"
+	fcMask       = "/30"
+
+	fcIfaceID  = "eth0"
+	tmpDirPath = "/tmp"
+
+	socketReadyCheckInterval = 100 * time.Millisecond
+	socketWaitTimeout        = 2 * time.Second
+
+	waitTimeForFCConfig = 500 * time.Millisecond
+
+	waitTimeForFCStart  = 10 * time.Second
+	waitTimeForStartCmd = 15 * time.Second
+)
+
+type Snapshot struct {
+	fc     *exec.Cmd
+	client *client.Firecracker
+
+	env        *Env
+	socketPath string
+}
+
+func waitForSocket(socketPath string, timeout time.Duration) error {
+	start := time.Now()
+
+	for {
+		_, err := os.Stat(socketPath)
+		if err == nil {
+			// Socket file exists
+			return nil
+		} else if os.IsNotExist(err) {
+			// Socket file doesn't exist yet
+
+			// Check if timeout has been reached
+			elapsed := time.Since(start)
+			if elapsed >= timeout {
+				return fmt.Errorf("timeout reached while waiting for socket file")
+			}
+
+			// Wait for a short duration before checking again
+			time.Sleep(socketReadyCheckInterval)
+		} else {
+			// Error occurred while checking for socket file
+			return err
+		}
+	}
+}
+
+func newFirecrackerClient(socketPath string) *client.Firecracker {
+	httpClient := client.NewHTTPClient(strfmt.NewFormats())
+
+	transport := firecracker.NewUnixSocketTransport(socketPath, nil, false)
+	httpClient.SetTransport(transport)
+
+	return httpClient
+}
+
+func NewSnapshot(ctx context.Context, tracer trace.Tracer, env *Env, network *FCNetwork, rootfs *Rootfs) (*Snapshot, error) {
+	childCtx, childSpan := tracer.Start(ctx, "new-snapshot")
+	defer childSpan.End()
+
+	socketFileName := fmt.Sprintf("fc-sock-%s.sock", env.BuildId)
+	socketPath := filepath.Join(tmpDirPath, socketFileName)
+
+	client := newFirecrackerClient(socketPath)
+
+	telemetry.ReportEvent(childCtx, "created fc client")
+
+	snapshot := &Snapshot{
+		socketPath: socketPath,
+		client:     client,
+		env:        env,
+		fc:         nil,
+	}
+
+	defer snapshot.cleanupFC(childCtx, tracer)
+
+	err := snapshot.startFCProcess(
+		childCtx,
+		tracer,
+		env.FirecrackerPath(),
+		network.namespaceID,
+		storage.KernelMountDir,
+		env.CacheKernelDir(),
+	)
+	if err != nil {
+		errMsg := fmt.Errorf("error starting fc process: %w", err)
+
+		return nil, errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "started fc process")
+
+	err = snapshot.configureFC(childCtx, tracer)
+	if err != nil {
+		errMsg := fmt.Errorf("error configuring fc: %w", err)
+
+		return nil, errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "configured fc")
+
+	// Wait for all necessary things in FC to start
+	// TODO: Maybe init should signalize when it's ready?
+	time.Sleep(waitTimeForFCStart)
+	telemetry.ReportEvent(childCtx, "waited for fc to start", attribute.Float64("seconds", float64(waitTimeForFCStart/time.Second)))
+
+	if env.StartCmd != "" {
+		// HACK: This is a temporary fix for a customer that needs a bigger time to start the command.
+		// TODO: Remove this after we can add customizable wait time for building templates.
+		if env.TemplateId == "zegbt9dl3l2ixqem82mm" || env.TemplateId == "ot5bidkk3j2so2j02uuz" {
+			time.Sleep(120 * time.Second)
+		} else {
+			time.Sleep(waitTimeForStartCmd)
+		}
+		telemetry.ReportEvent(childCtx, "waited for start command", attribute.Float64("seconds", float64(waitTimeForStartCmd/time.Second)))
+	}
+
+	err = snapshot.pauseFC(childCtx, tracer)
+	if err != nil {
+		errMsg := fmt.Errorf("error pausing fc: %w", err)
+
+		return nil, errMsg
+	}
+
+	err = snapshot.snapshotFC(childCtx, tracer)
+	if err != nil {
+		errMsg := fmt.Errorf("error snapshotting fc: %w", err)
+
+		return nil, errMsg
+	}
+
+	return snapshot, nil
+}
+
+func (s *Snapshot) startFCProcess(
+	ctx context.Context,
+	tracer trace.Tracer,
+	fcBinaryPath,
+	networkNamespaceID,
+	kernelMountDir,
+	kernelDirPath string,
+) error {
+	childCtx, childSpan := tracer.Start(ctx, "start-fc-process")
+	defer childSpan.End()
+
+	kernelMountCmd := fmt.Sprintf(
+		"mount --bind %s %s && ",
+		kernelDirPath,
+		kernelMountDir,
+	)
+
+	inNetNSCmd := fmt.Sprintf("ip netns exec %s ", networkNamespaceID)
+	fcCmd := fmt.Sprintf("%s --api-sock %s", fcBinaryPath, s.socketPath)
+
+	s.fc = exec.CommandContext(childCtx, "unshare", "-pm", "--kill-child", "--", "bash", "-c", kernelMountCmd+inNetNSCmd+fcCmd)
+
+	fcVMStdoutWriter := telemetry.NewEventWriter(childCtx, "stdout")
+	fcVMStderrWriter := telemetry.NewEventWriter(childCtx, "stderr")
+
+	stdoutPipe, err := s.fc.StdoutPipe()
+	if err != nil {
+		errMsg := fmt.Errorf("error creating fc stdout pipe: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	stderrPipe, err := s.fc.StderrPipe()
+	if err != nil {
+		errMsg := fmt.Errorf("error creating fc stderr pipe: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		closeErr := stdoutPipe.Close()
+		if closeErr != nil {
+			closeErrMsg := fmt.Errorf("error closing fc stdout pipe: %w", closeErr)
+			telemetry.ReportError(childCtx, closeErrMsg)
+		}
+
+		return errMsg
+	}
+
+	var outputWaitGroup sync.WaitGroup
+
+	outputWaitGroup.Add(1)
+	go func() {
+		scanner := bufio.NewScanner(stdoutPipe)
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			fcVMStdoutWriter.Write([]byte(line))
+		}
+
+		outputWaitGroup.Done()
+	}()
+
+	outputWaitGroup.Add(1)
+	go func() {
+		scanner := bufio.NewScanner(stderrPipe)
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			fcVMStderrWriter.Write([]byte(line))
+		}
+
+		outputWaitGroup.Done()
+	}()
+
+	err = s.fc.Start()
+	if err != nil {
+		errMsg := fmt.Errorf("error starting fc process: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "started fc process")
+
+	go func() {
+		anonymousChildCtx, anonymousChildSpan := tracer.Start(ctx, "handle-fc-process-wait")
+		defer anonymousChildSpan.End()
+
+		outputWaitGroup.Wait()
+
+		waitErr := s.fc.Wait()
+		if err != nil {
+			errMsg := fmt.Errorf("error waiting for fc process: %w", waitErr)
+			telemetry.ReportError(anonymousChildCtx, errMsg)
+		} else {
+			telemetry.ReportEvent(anonymousChildCtx, "fc process exited")
+		}
+	}()
+
+	// Wait for the FC process to start so we can use FC API
+	err = waitForSocket(s.socketPath, socketWaitTimeout)
+	if err != nil {
+		errMsg := fmt.Errorf("error waiting for fc socket: %w", err)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "fc process created socket")
+
+	return nil
+}
+
+func (s *Snapshot) configureFC(ctx context.Context, tracer trace.Tracer) error {
+	childCtx, childSpan := tracer.Start(ctx, "configure-fc")
+	defer childSpan.End()
+
+	ip := fmt.Sprintf("%s::%s:%s:instance:eth0:off:8.8.8.8", fcAddr, fcTapAddress, fcMaskLong)
+	kernelArgs := fmt.Sprintf("quiet loglevel=1 ip=%s reboot=k panic=1 pci=off nomodules i8042.nokbd i8042.noaux ipv6.disable=1 random.trust_cpu=on", ip)
+	kernelImagePath := storage.KernelMountedPath
+	bootSourceConfig := operations.PutGuestBootSourceParams{
+		Context: childCtx,
+		Body: &models.BootSource{
+			BootArgs:        kernelArgs,
+			KernelImagePath: &kernelImagePath,
+		},
+	}
+
+	_, err := s.client.Operations.PutGuestBootSource(&bootSourceConfig)
+	if err != nil {
+		errMsg := fmt.Errorf("error setting fc boot source config: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "set fc boot source config")
+
+	rootfs := "rootfs"
+	ioEngine := "Async"
+	isRootDevice := true
+	isReadOnly := false
+	pathOnHost := s.env.BuildRootfsPath()
+	driversConfig := operations.PutGuestDriveByIDParams{
+		Context: childCtx,
+		DriveID: rootfs,
+		Body: &models.Drive{
+			DriveID:      &rootfs,
+			PathOnHost:   pathOnHost,
+			IsRootDevice: &isRootDevice,
+			IsReadOnly:   isReadOnly,
+			IoEngine:     &ioEngine,
+		},
+	}
+
+	_, err = s.client.Operations.PutGuestDriveByID(&driversConfig)
+	if err != nil {
+		errMsg := fmt.Errorf("error setting fc drivers config: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "set fc drivers config")
+
+	ifaceID := fcIfaceID
+	hostDevName := fcTapName
+	networkConfig := operations.PutGuestNetworkInterfaceByIDParams{
+		Context: childCtx,
+		IfaceID: ifaceID,
+		Body: &models.NetworkInterface{
+			IfaceID:     &ifaceID,
+			GuestMac:    fcMacAddress,
+			HostDevName: &hostDevName,
+		},
+	}
+
+	_, err = s.client.Operations.PutGuestNetworkInterfaceByID(&networkConfig)
+	if err != nil {
+		errMsg := fmt.Errorf("error setting fc network config: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "set fc network config")
+
+	smt := true
+	trackDirtyPages := false
+
+	machineConfig := &models.MachineConfiguration{
+		VcpuCount:       &s.env.VCpuCount,
+		MemSizeMib:      &s.env.MemoryMB,
+		Smt:             &smt,
+		TrackDirtyPages: &trackDirtyPages,
+	}
+
+	if s.env.Hugepages() {
+		machineConfig.HugePages = models.MachineConfigurationHugePagesNr2M
+	}
+
+	machineConfigParams := operations.PutMachineConfigurationParams{
+		Context: childCtx,
+		Body:    machineConfig,
+	}
+
+	// hack for 16GB RAM templates
+	// todo fixme
+	// robert's (r33drichards) test template 3df60qm8cuefu2pub3mm
+	// customer template id raocbwn4f2mtdrjuajsx
+	if s.env.TemplateId == "3df60qm8cuefu2pub3mm" || s.env.TemplateId == "raocbwn4f2mtdrjuajsx" {
+		var sixteenGBRam int64 = 16384
+		machineConfig.MemSizeMib = &sixteenGBRam
+	}
+
+	_, err = s.client.Operations.PutMachineConfiguration(&machineConfigParams)
+	if err != nil {
+		errMsg := fmt.Errorf("error setting fc machine config: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "set fc machine config")
+
+	mmdsVersion := "V2"
+	mmdsConfig := operations.PutMmdsConfigParams{
+		Context: childCtx,
+		Body: &models.MmdsConfig{
+			Version:           &mmdsVersion,
+			NetworkInterfaces: []string{fcIfaceID},
+		},
+	}
+
+	_, err = s.client.Operations.PutMmdsConfig(&mmdsConfig)
+	if err != nil {
+		errMsg := fmt.Errorf("error setting fc mmds config: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "set fc mmds config")
+
+	// We may need to sleep before start - previous configuration is processes asynchronously. How to do this sync or in one go?
+	time.Sleep(waitTimeForFCConfig)
+
+	start := models.InstanceActionInfoActionTypeInstanceStart
+	startActionParams := operations.CreateSyncActionParams{
+		Context: childCtx,
+		Info: &models.InstanceActionInfo{
+			ActionType: &start,
+		},
+	}
+
+	_, err = s.client.Operations.CreateSyncAction(&startActionParams)
+	if err != nil {
+		errMsg := fmt.Errorf("error starting fc: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "started fc")
+
+	return nil
+}
+
+func (s *Snapshot) pauseFC(ctx context.Context, tracer trace.Tracer) error {
+	childCtx, childSpan := tracer.Start(ctx, "pause-fc")
+	defer childSpan.End()
+
+	state := models.VMStatePaused
+	pauseConfig := operations.PatchVMParams{
+		Context: childCtx,
+		Body: &models.VM{
+			State: &state,
+		},
+	}
+
+	_, err := s.client.Operations.PatchVM(&pauseConfig)
+	if err != nil {
+		errMsg := fmt.Errorf("error pausing vm: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "paused fc")
+
+	return nil
+}
+
+func (s *Snapshot) snapshotFC(ctx context.Context, tracer trace.Tracer) error {
+	childCtx, childSpan := tracer.Start(ctx, "snapshot-fc")
+	defer childSpan.End()
+
+	memfilePath := s.env.BuildMemfilePath()
+	snapfilePath := s.env.BuildSnapfilePath()
+	snapshotConfig := operations.CreateSnapshotParams{
+		Context: childCtx,
+		Body: &models.SnapshotCreateParams{
+			SnapshotType: models.SnapshotCreateParamsSnapshotTypeFull,
+			MemFilePath:  &memfilePath,
+			SnapshotPath: &snapfilePath,
+		},
+	}
+
+	_, err := s.client.Operations.CreateSnapshot(&snapshotConfig)
+	if err != nil {
+		errMsg := fmt.Errorf("error creating vm snapshot: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "created vm snapshot")
+
+	return nil
+}
+
+func (s *Snapshot) cleanupFC(ctx context.Context, tracer trace.Tracer) {
+	childCtx, childSpan := tracer.Start(ctx, "cleanup-fc")
+	defer childSpan.End()
+
+	if s.fc != nil {
+		err := s.fc.Cancel()
+		if err != nil {
+			errMsg := fmt.Errorf("error killing fc process: %w", err)
+			telemetry.ReportError(childCtx, errMsg)
+		} else {
+			telemetry.ReportEvent(childCtx, "killed fc process")
+		}
+	}
+
+	err := os.RemoveAll(s.socketPath)
+	if err != nil {
+		errMsg := fmt.Errorf("error removing fc socket %w", err)
+		telemetry.ReportError(childCtx, errMsg)
+	} else {
+		telemetry.ReportEvent(childCtx, "removed fc socket")
+	}
+}
+
+
+
+================================================
+File: internal/build/snapshot_other.go
+================================================
+//go:build !linux
+// +build !linux
+
+package build
+
+import (
+	"context"
+	"errors"
+
+	"go.opentelemetry.io/otel/trace"
+)
+
+var fcAddr = "127.0.0.1:5150"
+
+type Snapshot struct {
+}
+
+func NewSnapshot(ctx context.Context, tracer trace.Tracer, env *Env, network *FCNetwork, rootfs *Rootfs) (*Snapshot, error) {
+	return nil, errors.New("snapshot is not supported on this platform")
+}
+
+
+
+================================================
+File: internal/build/tar.go
+================================================
+package build
+
+import (
+	"archive/tar"
+	"fmt"
+	"io"
+	"os"
+)
+
+func addFileToTarWriter(writer *tar.Writer, file fileToTar) error {
+	f, err := os.Open(file.localPath)
+	if err != nil {
+		errMsg := fmt.Errorf("error opening file: %w", err)
+
+		return errMsg
+	}
+
+	defer func() {
+		closeErr := f.Close()
+		if closeErr != nil {
+			errMsg := fmt.Errorf("error closing file: %w", closeErr)
+			fmt.Print(errMsg)
+		}
+	}()
+
+	stat, err := f.Stat()
+	if err != nil {
+		errMsg := fmt.Errorf("error statting file: %w", err)
+
+		return errMsg
+	}
+
+	hdr := &tar.Header{
+		Name: file.tarPath, // The name of the file in the tar archive
+		Mode: 0o777,
+		Size: stat.Size(),
+	}
+
+	err = writer.WriteHeader(hdr)
+	if err != nil {
+		errMsg := fmt.Errorf("error writing tar header: %w", err)
+
+		return errMsg
+	}
+
+	_, err = io.Copy(writer, f)
+	if err != nil {
+		errMsg := fmt.Errorf("error copying file to tar: %w", err)
+
+		return errMsg
+	}
+
+	return nil
+}
+
+type fileToTar struct {
+	localPath string
+	tarPath   string
+}
+
+
+
+================================================
+File: internal/build/template.go
+================================================
+package build
+
+import (
+	"context"
+	_ "embed"
+	"fmt"
+	"io"
+	"os"
+	"text/template"
+
+	"github.com/docker/docker/client"
+	docker "github.com/fsouza/go-dockerclient"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+)
+
+type Env struct {
+	*storage.TemplateFiles
+
+	// Command to run when building the env.
+	StartCmd string
+
+	// The number of vCPUs to allocate to the VM.
+	VCpuCount int64
+
+	// The amount of RAM memory to allocate to the VM, in MiB.
+	MemoryMB int64
+
+	// The amount of free disk to allocate to the VM, in MiB.
+	DiskSizeMB int64
+
+	// Path to the directory where the temporary files for the build are stored.
+	BuildLogsWriter io.Writer
+
+	// Real size of the rootfs after building the env.
+	rootfsSize int64
+}
+
+//go:embed provision.sh
+var provisionEnvScriptFile string
+var EnvInstanceTemplate = template.Must(template.New("provisioning-script").Parse(provisionEnvScriptFile))
+
+// Real size in MB of rootfs after building the env
+func (e *Env) RootfsSizeMB() int64 {
+	return e.rootfsSize >> 20
+}
+
+func (e *Env) Build(ctx context.Context, tracer trace.Tracer, docker *client.Client, legacyDocker *docker.Client) error {
+	childCtx, childSpan := tracer.Start(ctx, "build")
+	defer childSpan.End()
+
+	err := os.MkdirAll(e.BuildDir(), 0o777)
+	if err != nil {
+		errMsg := fmt.Errorf("error initializing directories for building env '%s' during build '%s': %w", e.TemplateId, e.BuildId, err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	rootfs, err := NewRootfs(childCtx, tracer, e, docker, legacyDocker)
+	if err != nil {
+		errMsg := fmt.Errorf("error creating rootfs for env '%s' during build '%s': %w", e.TemplateId, e.BuildId, err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	network, err := NewFCNetwork(childCtx, tracer, e)
+	if err != nil {
+		errMsg := fmt.Errorf("error network setup for FC while building env '%s' during build '%s': %w", e.TemplateId, e.BuildId, err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	defer network.Cleanup(childCtx, tracer)
+
+	_, err = NewSnapshot(childCtx, tracer, e, network, rootfs)
+	if err != nil {
+		errMsg := fmt.Errorf("error snapshot for env '%s' during build '%s': %w", e.TemplateId, e.BuildId, err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	return nil
+}
+
+func (e *Env) Remove(ctx context.Context, tracer trace.Tracer) error {
+	childCtx, childSpan := tracer.Start(ctx, "move-to-env-dir")
+	defer childSpan.End()
+
+	err := os.RemoveAll(e.BuildDir())
+	if err != nil {
+		errMsg := fmt.Errorf("error removing build dir: %w", err)
+		telemetry.ReportCriticalError(childCtx, errMsg)
+
+		return errMsg
+	}
+
+	telemetry.ReportEvent(childCtx, "removed build dir")
+
+	return nil
+}
+
+
+
+================================================
+File: internal/build/writer/writer.go
+================================================
+package writer
+
+import (
+	"github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
+	"go.uber.org/zap"
+)
+
+type BuildLogsWriter struct {
+	stream template_manager.TemplateService_TemplateCreateServer
+	logger *zap.Logger
+}
+
+func (w BuildLogsWriter) Write(p []byte) (n int, err error) {
+	log := string(p)
+	w.logger.Info(log)
+	err = w.stream.Send(&template_manager.TemplateBuildLog{Log: log})
+	if err != nil {
+		return 0, err
+	}
+
+	return len(p), nil
+}
+
+func New(stream template_manager.TemplateService_TemplateCreateServer, logger *zap.Logger) BuildLogsWriter {
+	writer := BuildLogsWriter{
+		stream: stream,
+		logger: logger,
+	}
+
+	return writer
+}
+
+
+
+================================================
+File: internal/constants/main.go
+================================================
+package constants
+
+import (
+	"fmt"
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"strings"
+)
+
+func CheckRequired() error {
+	var missing []string
+
+	if consts.GCPProject == "" {
+		missing = append(missing, "GCP_PROJECT_ID")
+	}
+
+	if consts.DockerRegistry == "" {
+		missing = append(missing, "GCP_DOCKER_REPOSITORY_NAME")
+	}
+
+	if consts.GoogleServiceAccountSecret == "" {
+		missing = append(missing, "GOOGLE_SERVICE_ACCOUNT_BASE64")
+	}
+
+	if consts.GCPRegion == "" {
+		missing = append(missing, "GCP_REGION")
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("missing environment variables: %s", strings.Join(missing, ", "))
+	}
+
+	return nil
+}
+
+
+
+================================================
+File: internal/constants/service.go
+================================================
+package constants
+
+const ServiceName = "template-manager"
+
+
+
+================================================
+File: internal/server/create_template.go
+================================================
+package server
+
+import (
+	"context"
+	"fmt"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/grpc/metadata"
+
+	template_manager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/build"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/build/writer"
+)
+
+const cleanupTimeout = time.Second * 10
+
+func (s *serverStore) TemplateCreate(templateRequest *template_manager.TemplateCreateRequest, stream template_manager.TemplateService_TemplateCreateServer) error {
+	ctx := stream.Context()
+
+	childCtx, childSpan := s.tracer.Start(ctx, "template-create")
+	defer childSpan.End()
+
+	config := templateRequest.Template
+
+	childSpan.SetAttributes(
+		attribute.String("env.id", config.TemplateID),
+		attribute.String("env.build.id", config.BuildID),
+		attribute.String("env.kernel.version", config.KernelVersion),
+		attribute.String("env.firecracker.version", config.FirecrackerVersion),
+		attribute.String("env.start_cmd", config.StartCommand),
+		attribute.Int64("env.memory_mb", int64(config.MemoryMB)),
+		attribute.Int64("env.vcpu_count", int64(config.VCpuCount)),
+		attribute.Bool("env.huge_pages", config.HugePages),
+	)
+
+	logsWriter := writer.New(
+		stream,
+		s.buildLogger.
+			With(zap.Field{Type: zapcore.StringType, Key: "envID", String: config.TemplateID}).
+			With(zap.Field{Type: zapcore.StringType, Key: "buildID", String: config.BuildID}),
+	)
+
+	template := &build.Env{
+		TemplateFiles: storage.NewTemplateFiles(
+			config.TemplateID,
+			config.BuildID,
+			config.KernelVersion,
+			config.FirecrackerVersion,
+			config.HugePages,
+		),
+		VCpuCount:       int64(config.VCpuCount),
+		MemoryMB:        int64(config.MemoryMB),
+		StartCmd:        config.StartCommand,
+		DiskSizeMB:      int64(config.DiskSizeMB),
+		BuildLogsWriter: logsWriter,
+	}
+
+	buildStorage := s.templateStorage.NewBuild(template.TemplateFiles)
+
+	var err error
+
+	// Remove local template files if build fails
+	defer func() {
+		removeCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+
+		removeErr := template.Remove(removeCtx, s.tracer)
+		if removeErr != nil {
+			telemetry.ReportError(childCtx, removeErr)
+		}
+	}()
+
+	err = template.Build(childCtx, s.tracer, s.dockerClient, s.legacyDockerClient)
+	if err != nil {
+		_, _ = logsWriter.Write([]byte(fmt.Sprintf("Error building environment: %v", err)))
+
+		telemetry.ReportCriticalError(childCtx, err)
+
+		return err
+	}
+
+	// Remove build files if build fails or times out
+	defer func() {
+		if err != nil {
+			removeCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+			defer cancel()
+
+			removeErr := buildStorage.Remove(removeCtx)
+			if removeErr != nil {
+				telemetry.ReportError(childCtx, removeErr)
+			}
+		}
+	}()
+
+	memfilePath := template.BuildMemfilePath()
+	rootfsPath := template.BuildRootfsPath()
+
+	upload := buildStorage.Upload(
+		childCtx,
+		template.BuildSnapfilePath(),
+		&memfilePath,
+		&rootfsPath,
+	)
+
+	cmd := exec.Command(storage.HostEnvdPath, "-version")
+
+	out, err := cmd.Output()
+	if err != nil {
+		_, _ = logsWriter.Write([]byte(fmt.Sprintf("Error while getting envd version: %v", err)))
+
+		return err
+	}
+
+	uploadErr := <-upload
+	if uploadErr != nil {
+		errMsg := fmt.Sprintf("Error while uploading build files: %v", uploadErr)
+		_, _ = logsWriter.Write([]byte(errMsg))
+
+		return uploadErr
+	}
+
+	version := strings.TrimSpace(string(out))
+	trailerMetadata := metadata.Pairs(
+		storage.RootfsSizeKey, strconv.FormatInt(template.RootfsSizeMB(), 10),
+		storage.EnvdVersionKey, version,
+	)
+
+	stream.SetTrailer(trailerMetadata)
+
+	telemetry.ReportEvent(childCtx, "Environment built")
+
+	return nil
+}
+
+
+
+================================================
+File: internal/server/delete_template.go
+================================================
+package server
+
+import (
+	"context"
+
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	template_manager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/template"
+)
+
+func (s *serverStore) TemplateBuildDelete(ctx context.Context, in *template_manager.TemplateBuildDeleteRequest) (*emptypb.Empty, error) {
+	childCtx, childSpan := s.tracer.Start(ctx, "template-delete-request")
+	defer childSpan.End()
+
+	err := template.Delete(childCtx, s.tracer, s.artifactRegistry, s.templateStorage, in.BuildID)
+	if err != nil {
+		return nil, err
+	}
+
+	return nil, nil
+}
+
+
+
+================================================
+File: internal/server/main.go
+================================================
+package server
+
+import (
+	"context"
+	"time"
+
+	artifactregistry "cloud.google.com/go/artifactregistry/apiv1"
+	"github.com/docker/docker/client"
+	docker "github.com/fsouza/go-dockerclient"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/recovery"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/selector"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
+
+	e2bgrpc "github.com/e2b-dev/infra/packages/shared/pkg/grpc"
+	templatemanager "github.com/e2b-dev/infra/packages/shared/pkg/grpc/template-manager"
+	l "github.com/e2b-dev/infra/packages/shared/pkg/logger"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/constants"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/template"
+)
+
+type serverStore struct {
+	templatemanager.UnimplementedTemplateServiceServer
+	server             *grpc.Server
+	tracer             trace.Tracer
+	logger             *zap.Logger
+	buildLogger        *zap.Logger
+	dockerClient       *client.Client
+	legacyDockerClient *docker.Client
+	artifactRegistry   *artifactregistry.Client
+	templateStorage    *template.Storage
+}
+
+func New(logger *zap.Logger, buildLogger *zap.Logger) *grpc.Server {
+	ctx := context.Background()
+	logger.Info("Initializing template manager")
+
+	opts := []logging.Option{
+		logging.WithLogOnEvents(logging.StartCall, logging.PayloadReceived, logging.PayloadSent, logging.FinishCall),
+		logging.WithLevels(logging.DefaultServerCodeToLevel),
+		logging.WithFieldsFromContext(logging.ExtractFields),
+	}
+
+	s := grpc.NewServer(
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             5 * time.Second, // Minimum time between pings from client
+			PermitWithoutStream: true,            // Allow pings even when no active streams
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    15 * time.Second, // Server sends keepalive pings every 15s
+			Timeout: 5 * time.Second,  // Wait 5s for response before considering dead
+		}),
+		grpc.StatsHandler(e2bgrpc.NewStatsWrapper(otelgrpc.NewServerHandler())),
+		grpc.ChainUnaryInterceptor(
+			recovery.UnaryServerInterceptor(),
+			selector.UnaryServerInterceptor(
+				logging.UnaryServerInterceptor(l.GRPCLogger(logger), opts...),
+				l.WithoutHealthCheck(),
+			),
+		),
+	)
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		panic(err)
+	}
+
+	legacyClient, err := docker.NewClientFromEnv()
+	if err != nil {
+		panic(err)
+	}
+
+	artifactRegistry, err := artifactregistry.NewClient(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	templateStorage := template.NewStorage(ctx)
+
+	templatemanager.RegisterTemplateServiceServer(s, &serverStore{
+		tracer:             otel.Tracer(constants.ServiceName),
+		logger:             logger,
+		buildLogger:        buildLogger,
+		dockerClient:       dockerClient,
+		legacyDockerClient: legacyClient,
+		artifactRegistry:   artifactRegistry,
+		templateStorage:    templateStorage,
+	})
+
+	grpc_health_v1.RegisterHealthServer(s, health.NewServer())
+	return s
+}
+
+
+
+================================================
+File: internal/template/main.go
+================================================
+package template
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	artifactregistry "cloud.google.com/go/artifactregistry/apiv1"
+	"cloud.google.com/go/artifactregistry/apiv1/artifactregistrypb"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc/codes"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
+	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/gogo/status"
+)
+
+func GetDockerImageURL(templateID string) string {
+	// DockerImagesURL is the URL to the docker images in the artifact registry
+	return fmt.Sprintf("projects/%s/locations/%s/repositories/%s/packages/%s", consts.GCPProject, consts.GCPRegion, consts.DockerRegistry, templateID)
+}
+
+func Delete(
+	ctx context.Context,
+	tracer trace.Tracer,
+	artifactRegistry *artifactregistry.Client,
+	templateStorage *Storage,
+	buildId string,
+) error {
+	childCtx, childSpan := tracer.Start(ctx, "delete-template")
+	defer childSpan.End()
+
+	err := templateStorage.Remove(ctx, buildId)
+	if err != nil {
+		return fmt.Errorf("error when deleting template objects: %w", err)
+	}
+
+	op, artifactRegistryDeleteErr := artifactRegistry.DeletePackage(ctx, &artifactregistrypb.DeletePackageRequest{Name: GetDockerImageURL(buildId)})
+	if artifactRegistryDeleteErr != nil {
+		if status.Code(artifactRegistryDeleteErr) == codes.NotFound {
+			log.Printf("template image not found in registry, skipping deletion: %v", artifactRegistryDeleteErr)
+			telemetry.ReportEvent(childCtx, fmt.Sprintf("template image not found in registry, skipping deletion: %v", artifactRegistryDeleteErr))
+		} else {
+			errMsg := fmt.Errorf("error when deleting template image from registry: %w", artifactRegistryDeleteErr)
+			telemetry.ReportCriticalError(childCtx, errMsg)
+		}
+	} else {
+		telemetry.ReportEvent(childCtx, "started deleting template image from registry")
+
+		waitErr := op.Wait(childCtx)
+		if waitErr != nil {
+			errMsg := fmt.Errorf("error when waiting for template image deleting from registry: %w", waitErr)
+			telemetry.ReportCriticalError(childCtx, errMsg)
+		} else {
+			telemetry.ReportEvent(childCtx, "deleted template image from registry")
+		}
+	}
+
+	return nil
+}
+
+
+
+================================================
+File: internal/template/storage.go
+================================================
+package template
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage/gcs"
+)
+
+type Storage struct {
+	bucket *gcs.BucketHandle
+}
+
+func NewStorage(ctx context.Context) *Storage {
+	return &Storage{
+		bucket: gcs.GetTemplateBucket(),
+	}
+}
+
+func (t *Storage) Remove(ctx context.Context, buildId string) error {
+	err := gcs.RemoveDir(ctx, t.bucket, buildId)
+	if err != nil {
+		return fmt.Errorf("error when removing template '%s': %w", buildId, err)
+	}
+
+	return nil
+}
+
+func (t *Storage) NewBuild(files *storage.TemplateFiles) *storage.TemplateBuild {
+	return storage.NewTemplateBuild(nil, nil, files)
+}
+
+
+
+================================================
+File: internal/test/build.go
+================================================
+package test
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/docker/docker/client"
+	docker "github.com/fsouza/go-dockerclient"
+	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel"
+
+	"github.com/e2b-dev/infra/packages/shared/pkg/schema"
+	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/build"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/template"
+)
+
+func Build(templateID, buildID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*3)
+	defer cancel()
+
+	tracer := otel.Tracer("test")
+
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		panic(err)
+	}
+
+	legacyClient, err := docker.NewClientFromEnv()
+	if err != nil {
+		panic(err)
+	}
+
+	var buf bytes.Buffer
+	t := build.Env{
+		TemplateFiles: storage.NewTemplateFiles(
+			templateID,
+			buildID,
+			schema.DefaultKernelVersion,
+			schema.DefaultFirecrackerVersion,
+			true,
+		),
+		VCpuCount:       2,
+		MemoryMB:        256,
+		StartCmd:        "",
+		DiskSizeMB:      512,
+		BuildLogsWriter: &buf,
+	}
+
+	err = t.Build(ctx, tracer, dockerClient, legacyClient)
+	if err != nil {
+		errMsg := fmt.Errorf("error building template: %w", err)
+
+		fmt.Fprintln(os.Stderr, errMsg)
+
+		return
+	}
+
+	tempStorage := template.NewStorage(ctx)
+
+	buildStorage := tempStorage.NewBuild(t.TemplateFiles)
+
+	memfilePath := t.BuildMemfilePath()
+	rootfsPath := t.BuildRootfsPath()
+
+	upload := buildStorage.Upload(
+		ctx,
+		t.BuildSnapfilePath(),
+		&memfilePath,
+		&rootfsPath,
+	)
+
+	err = <-upload
+	if err != nil {
+		log.Fatal().Err(err).Msg("error uploading build files")
+	}
+}
+
+
