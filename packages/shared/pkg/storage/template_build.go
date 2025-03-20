@@ -92,27 +92,47 @@ func (t *TemplateBuild) uploadMemfile(ctx context.Context, memfilePath string) e
 }
 
 func (t *TemplateBuild) uploadRootfsHeader(ctx context.Context, h *header.Header) error {
-	object := gcs.NewObject(ctx, t.bucket, t.files.StorageRootfsHeaderPath())
 
-	serialized, err := header.Serialize(h.Metadata, h.Mapping)
-	if err != nil {
-		return fmt.Errorf("error when serializing memfile header: %w", err)
+	if consts.CloudProviderEnv == consts.AWS {
+		fmt.Println("uploading rootfsheader to s3", t.files.StorageRootfsHeaderPath())
+		//panic("not implemented")
+		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageMemfilePath())
+		object.UploadWithCli(ctx, t.files.StorageRootfsHeaderPath())
 	}
 
-	_, err = object.ReadFrom(serialized)
-	if err != nil {
-		return fmt.Errorf("error when uploading memfile header: %w", err)
+	if consts.CloudProviderEnv == consts.GCP {
+		object := gcs.NewObject(ctx, t.bucket, t.files.StorageRootfsHeaderPath())
+
+		serialized, err := header.Serialize(h.Metadata, h.Mapping)
+		if err != nil {
+			return fmt.Errorf("error when serializing memfile header: %w", err)
+		}
+
+		_, err = object.ReadFrom(serialized)
+		if err != nil {
+			return fmt.Errorf("error when uploading memfile header: %w", err)
+		}
 	}
 
 	return nil
 }
 
 func (t *TemplateBuild) uploadRootfs(ctx context.Context, rootfsPath string) error {
-	object := gcs.NewObject(ctx, t.bucket, t.files.StorageRootfsPath())
 
-	err := object.UploadWithCli(ctx, rootfsPath)
-	if err != nil {
-		return fmt.Errorf("error when uploading rootfs: %w", err)
+	if consts.CloudProviderEnv == consts.AWS {
+		fmt.Println("uploading rootfs to s3", t.files.StorageRootfsPath())
+		//panic("not implemented")
+		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageRootfsPath())
+		object.UploadWithCli(ctx, t.files.StorageRootfsPath())
+	}
+
+	if consts.CloudProviderEnv == consts.GCP {
+		object := gcs.NewObject(ctx, t.bucket, t.files.StorageRootfsPath())
+
+		err := object.UploadWithCli(ctx, rootfsPath)
+		if err != nil {
+			return fmt.Errorf("error when uploading rootfs: %w", err)
+		}
 	}
 
 	return nil
@@ -120,11 +140,21 @@ func (t *TemplateBuild) uploadRootfs(ctx context.Context, rootfsPath string) err
 
 // Snapfile is small enough so we dont use composite upload.
 func (t *TemplateBuild) uploadSnapfile(ctx context.Context, snapfile io.Reader) error {
-	object := gcs.NewObject(ctx, t.bucket, t.files.StorageSnapfilePath())
 
-	n, err := object.ReadFrom(snapfile)
-	if err != nil {
-		return fmt.Errorf("error when uploading snapfile (%d bytes): %w", n, err)
+	if consts.CloudProviderEnv == consts.AWS {
+		fmt.Println("uploading snapfile to s3", t.files.StorageSnapfilePath())
+		//panic("not implemented")
+		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageSnapfilePath())
+		object.UploadWithCli(ctx, t.files.StorageSnapfilePath())
+	}
+
+	if consts.CloudProviderEnv == consts.GCP {
+		object := gcs.NewObject(ctx, t.bucket, t.files.StorageSnapfilePath())
+
+		n, err := object.ReadFrom(snapfile)
+		if err != nil {
+			return fmt.Errorf("error when uploading snapfile (%d bytes): %w", n, err)
+		}
 	}
 
 	return nil

@@ -394,5 +394,7 @@ func (o *Object) UploadWithCli(ctx context.Context, path string) error {
 		return fmt.Errorf("failed to upload file to S3: %w\n%s", err, string(output))
 	}
 
+	fmt.Println("Uploaded file to S3:", fmt.Sprintf("s3://%s/%s", o.bucket, o.name))
+
 	return nil
 }

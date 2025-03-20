@@ -16,6 +16,7 @@ type Storage struct {
 }
 
 func NewStorage(ctx context.Context) *Storage {
+	fmt.Println("Cloud provider", consts.CloudProviderEnv)
 	if consts.CloudProviderEnv == consts.AWS {
 		return &Storage{
 			bucket:   nil,
@@ -40,6 +41,7 @@ func (t *Storage) Remove(ctx context.Context, buildId string) error {
 		if err != nil {
 			return fmt.Errorf("error when removing template '%s': %w", buildId, err)
 		}
+		return nil
 	}
 
 	if consts.CloudProviderEnv == consts.GCP {
@@ -47,6 +49,7 @@ func (t *Storage) Remove(ctx context.Context, buildId string) error {
 		if err != nil {
 			return fmt.Errorf("error when removing template '%s': %w", buildId, err)
 		}
+		return nil
 	}
 
 	panic(fmt.Sprintf("invalid cloud provider: %s", consts.CloudProviderEnv))
