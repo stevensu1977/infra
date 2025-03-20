@@ -224,8 +224,8 @@ func (o *Object) Attrs(ctx context.Context) (*ObjectAttr, error) {
 			Name: o.name,
 		}
 
-		if resp.ContentLength != 0 {
-			attr.Size = resp.ContentLength
+		if resp.ContentLength != nil {
+			attr.Size = *resp.ContentLength
 		}
 
 		if resp.LastModified != nil {
@@ -264,8 +264,8 @@ func (o *Object) Size(ctx context.Context) (int64, error) {
 		if err != nil {
 			return err
 		}
-		if resp.ContentLength != 0 {
-			size = resp.ContentLength
+		if resp.ContentLength != nil {
+			size = *resp.ContentLength
 		}
 		return nil
 	}

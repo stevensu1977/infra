@@ -51,7 +51,6 @@ func (t *Storage) Remove(ctx context.Context, buildId string) error {
 
 	panic(fmt.Sprintf("invalid cloud provider: %s", consts.CloudProviderEnv))
 
-	return nil
 }
 
 func (t *Storage) NewBuild(files *storage.TemplateFiles) *storage.TemplateBuild {

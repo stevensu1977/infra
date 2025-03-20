@@ -47,7 +47,7 @@ func RemoveDir(ctx context.Context, bucket *BucketHandle, dir string) error {
 			Bucket: aws.String(bucket.Name()),
 			Delete: &types.Delete{
 				Objects: objectIds,
-				Quiet:   true,
+				Quiet:   aws.Bool(true),
 			},
 		})
 		if err != nil {

@@ -30,6 +30,7 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage"
 	"github.com/e2b-dev/infra/packages/shared/pkg/telemetry"
+	"github.com/e2b-dev/infra/packages/template-manager/internal/provider"
 )
 
 const (
@@ -43,6 +44,8 @@ var authConfig = registry.AuthConfig{
 	Username: "_json_key_base64",
 	Password: consts.GoogleServiceAccountSecret,
 }
+
+var awsProvider = provider.NewProvider(consts.AWSRegion)
 
 type Rootfs struct {
 	client       *client.Client
@@ -99,18 +102,52 @@ func NewRootfs(ctx context.Context, tracer trace.Tracer, env *Env, docker *clien
 	return rootfs, nil
 }
 
+func encodeAuthConfig(authConfig registry.AuthConfig) (string, error) {
+	authConfigBytes, err := json.Marshal(authConfig)
+	if err != nil {
+		return "", fmt.Errorf("error marshaling auth config: %w", err)
+	}
+	return base64.URLEncoding.EncodeToString(authConfigBytes), nil
+}
+
 func (r *Rootfs) pullDockerImage(ctx context.Context, tracer trace.Tracer) error {
+
+	var authConfigBase64 string
+	var err error
+
 	childCtx, childSpan := tracer.Start(ctx, "pull-docker-image")
 	defer childSpan.End()
 
-	authConfigBytes, err := json.Marshal(authConfig)
-	if err != nil {
-		errMsg := fmt.Errorf("error marshaling auth config: %w", err)
+	if consts.CloudProviderEnv == consts.AWS {
+		accountID, err := awsProvider.GetAWSAccountID()
+		if err != nil {
+			errMsg := fmt.Errorf("error getting AWS account ID: %w", err)
+			telemetry.ReportError(childCtx, errMsg)
+			return errMsg
+		}
+		authToken, err := awsProvider.GetECRPassword()
+		if err != nil {
+			errMsg := fmt.Errorf("error getting ECR password: %w", err)
+			telemetry.ReportError(childCtx, errMsg)
+			return errMsg
+		}
+		authConfigBase64, err = encodeAuthConfig(registry.AuthConfig{
+			Username:      "AWS",
+			Password:      authToken,
+			ServerAddress: fmt.Sprintf("https://%s.dkr.ecr.%s.amazonaws.com", accountID, consts.AWSRegion),
+		})
 
-		return errMsg
+		fmt.Println("authConfigBase64", authToken, authConfigBase64)
+	}
+	if consts.CloudProviderEnv == consts.GCP {
+		authConfigBase64, err = encodeAuthConfig(authConfig)
+		if err != nil {
+			errMsg := fmt.Errorf("error marshaling auth config: %w", err)
+
+			return errMsg
+		}
 	}
 
-	authConfigBase64 := base64.URLEncoding.EncodeToString(authConfigBytes)
 	if consts.DockerAuthConfig != "" {
 		authConfigBase64 = consts.DockerAuthConfig
 	}
@@ -164,10 +201,29 @@ func (r *Rootfs) cleanupDockerImage(ctx context.Context, tracer trace.Tracer) {
 }
 
 func (r *Rootfs) dockerTag() string {
-	//fmt.Println(fmt.Sprintf("%s-docker.pkg.dev/%s/%s/%s:%s", consts.GCPRegion, consts.GCPProject, consts.DockerRegistry, r.env.TemplateId, r.env.BuildId))
-	//return fmt.Sprintf("%s-docker.pkg.dev/%s/%s/%s:%s", consts.GCPRegion, consts.GCPProject, consts.DockerRegistry, r.env.TemplateId, r.env.BuildId)
-	//return "ubuntu:latest"
-	return "alpine:latest"
+	var tag string = "ubuntu:latest"
+	var accountID string
+	if consts.AWSAccountID != "" {
+		accountID = consts.AWSAccountID
+	} else {
+		_accountID, err := awsProvider.GetAWSAccountID()
+		if err != nil {
+			errMsg := fmt.Errorf("error getting AWS account ID: %w", err)
+			panic(errMsg)
+		}
+		accountID = _accountID
+	}
+	if consts.CloudProviderEnv == consts.GCP {
+		tag = fmt.Sprintf("%s-docker.pkg.dev/%s/%s/%s:%s", consts.GCPRegion, consts.GCPProject, consts.DockerRegistry, r.env.TemplateId, r.env.BuildId)
+
+	}
+	if consts.CloudProviderEnv == consts.AWS {
+		tag = fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com/%s:%s", accountID, consts.AWSRegion, r.env.TemplateId, r.env.BuildId)
+
+	}
+	fmt.Println("DockerTag", tag)
+	return tag
+
 }
 
 type PostProcessor struct {
