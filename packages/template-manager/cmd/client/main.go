@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -12,8 +13,23 @@ import (
 )
 
 func main() {
+	// Define command line flags
+	host := flag.String("host", "localhost", "Host")
+	port := flag.Int("port", 5009, "Server port")
+	templateID := flag.String("template-id", "example-template", "Template ID")
+	buildID := flag.String("build-id", "build-123", "Build ID")
+	memoryMB := flag.Int("memory", 1024, "Memory in MB")
+	vcpuCount := flag.Int("vcpu", 2, "Number of virtual CPUs")
+	diskSizeMB := flag.Int("disk", 10240, "Disk size in MB")
+	kernelVersion := flag.String("kernel", "5.10", "Kernel version")
+	firecrackerVersion := flag.String("firecracker", "1.0", "Firecracker version")
+	startCommand := flag.String("start-cmd", "", "Start command")
+	hugePages := flag.Bool("huge-pages", false, "Enable huge pages")
+	
+	flag.Parse()
+
 	// Set up connection to the server
-	conn, err := grpc.Dial("localhost:5009", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.Dial(fmt.Sprintf("%s:%d", *host, *port), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("Failed to connect: %v", err)
 	}
@@ -24,15 +40,15 @@ func main() {
 
 	// Example: Create a template
 	template := &pb.TemplateConfig{
-		TemplateID:         "example-template",
-		BuildID:            "build-123",
-		MemoryMB:           1024,
-		VCpuCount:          2,
-		DiskSizeMB:         10240,
-		KernelVersion:      "5.10",
-		FirecrackerVersion: "1.0",
-		StartCommand:       "./start.sh",
-		HugePages:          false,
+		TemplateID:         *templateID,
+		BuildID:            *buildID,
+		MemoryMB:          int32(*memoryMB),
+		VCpuCount:         int32(*vcpuCount),
+		DiskSizeMB:        int32(*diskSizeMB),
+		KernelVersion:     *kernelVersion,
+		FirecrackerVersion: *firecrackerVersion,
+		StartCommand:      *startCommand,
+		HugePages:         *hugePages,
 	}
 
 	req := &pb.TemplateCreateRequest{
@@ -58,7 +74,7 @@ func main() {
 
 	// Example: Delete a template build
 	deleteReq := &pb.TemplateBuildDeleteRequest{
-		BuildID: "build-123",
+		BuildID: *buildID,
 	}
 
 	_, err = client.TemplateBuildDelete(context.Background(), deleteReq)
