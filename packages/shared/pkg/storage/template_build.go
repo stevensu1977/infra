@@ -221,12 +221,7 @@ func (t *TemplateBuild) Upload(
 			return nil
 		}
 
-		// snapfile, err := os.Open(snapfilePath)
-		// if err != nil {
-		// 	return err
-		// }
-
-		// defer snapfile.Close()
+		
 
 		err := t.uploadSnapfile(ctx, snapfilePath)
 		if err != nil {

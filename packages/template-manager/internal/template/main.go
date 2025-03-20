@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"errors"
 
 	artifactregistry "cloud.google.com/go/artifactregistry/apiv1"
 	"cloud.google.com/go/artifactregistry/apiv1/artifactregistrypb"
@@ -16,15 +17,15 @@ import (
 	"github.com/gogo/status"
 
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
+	"github.com/aws/aws-sdk-go-v2/service/ecr/types"
 )
 
 
 var awsProvider = provider.NewProvider(consts.AWSRegion)
 
 
-func GetDockerImageURL(templateID string) string {
+func GetDockerImageURL(templateID string, buildId string) string {
 	// DockerImagesURL is the URL to the docker images in the artifact registry
-	
 	
 	if consts.CloudProviderEnv == consts.GCP {
 		return fmt.Sprintf("projects/%s/locations/%s/repositories/%s/packages/%s", consts.GCPProject, consts.GCPRegion, consts.DockerRegistry, templateID)
@@ -39,7 +40,7 @@ func GetDockerImageURL(templateID string) string {
 			}
 			accountID = _accountID
 		}
-		return fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com/%s:latest", accountID, consts.AWSRegion, templateID)
+		return fmt.Sprintf("%s.dkr.ecr.%s.amazonaws.com/%s:%s", accountID, consts.AWSRegion, templateID, buildId)
 	}
 	fmt.Errorf("unsupported cloud provider: %s", consts.CloudProviderEnv)
 	return ""
@@ -51,6 +52,7 @@ func Delete(
 	artifactRegistry *artifactregistry.Client,
 	ecrClient *ecr.Client,
 	templateStorage *Storage,
+	templateID string,
 	buildId string,
 ) error {
 	childCtx, childSpan := tracer.Start(ctx, "delete-template")
@@ -63,17 +65,17 @@ func Delete(
 
 	switch consts.CloudProviderEnv {
 	case consts.GCP:
-		return deleteFromGCP(childCtx, artifactRegistry, buildId)
+		return deleteFromGCP(childCtx, artifactRegistry, templateID, buildId)
 	case consts.AWS:
-		return deleteFromAWS(childCtx, buildId)
+		return deleteFromAWS(childCtx,ecrClient, templateID, buildId)
 	default:
 		return fmt.Errorf("unsupported cloud provider: %s", consts.CloudProviderEnv)
 	}
 }
 
-func deleteFromGCP(ctx context.Context, artifactRegistry *artifactregistry.Client, buildId string) error {
+func deleteFromGCP(ctx context.Context, artifactRegistry *artifactregistry.Client, templateID string, buildId string) error {
 	op, artifactRegistryDeleteErr := artifactRegistry.DeletePackage(ctx, &artifactregistrypb.DeletePackageRequest{
-		Name: GetDockerImageURL(buildId),
+		Name: GetDockerImageURL(templateID, buildId),
 	})
 
 	if artifactRegistryDeleteErr != nil {
@@ -99,12 +101,30 @@ func deleteFromGCP(ctx context.Context, artifactRegistry *artifactregistry.Clien
 	return nil
 }
 
-func deleteFromAWS(ctx context.Context, buildId string) error {
-	// TODO: Implement AWS ECR deletion logic
-	// This would typically involve:
-	// 1. Creating an AWS ECR client
-	// 2. Using BatchDeleteImage or DeleteRepository API
-	telemetry.ReportEvent(ctx, fmt.Sprintf("AWS deletion not implemented yet: %s", GetDockerImageURL(buildId)))
-	//return fmt.Errorf("AWS deletion not implemented yet")
+func deleteFromAWS(ctx context.Context, ecrClient *ecr.Client, templateID string, buildId string) error {
+	fmt.Println("Deleting template image from AWS ECR registry",templateID, buildId)
+	imageIdentifier := &ecr.BatchDeleteImageInput{
+		RepositoryName: &templateID,
+		ImageIds: []types.ImageIdentifier{
+			{
+				ImageTag: &buildId,
+			},
+		},
+	}
+
+	_, err := ecrClient.BatchDeleteImage(ctx, imageIdentifier)
+	if err != nil {
+		var notFoundErr *types.RepositoryNotFoundException
+		if errors.As(err, &notFoundErr) {
+			log.Printf("template image not found in AWS ECR registry, skipping deletion: %v", err)
+			telemetry.ReportEvent(ctx, fmt.Sprintf("template image not found in AWS ECR registry, skipping deletion: %v", err))
+			return nil
+		}
+		errMsg := fmt.Errorf("error when deleting template image from AWS ECR registry: %w", err)
+		telemetry.ReportCriticalError(ctx, errMsg)
+		return errMsg
+	}
+
+	telemetry.ReportEvent(ctx, "deleted template image from AWS ECR registry")
 	return nil
 }
