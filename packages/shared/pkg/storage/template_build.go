@@ -3,9 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
-	"io"
-	"os"
-
+	
 	"github.com/e2b-dev/infra/packages/shared/pkg/consts"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/gcs"
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
@@ -73,8 +71,7 @@ func (t *TemplateBuild) uploadMemfileHeader(ctx context.Context, h *header.Heade
 func (t *TemplateBuild) uploadMemfile(ctx context.Context, memfilePath string) error {
 
 	if consts.CloudProviderEnv == consts.AWS {
-		fmt.Printf("Uploading memfile to s3: %s\n", t.s3.Name(),memfilePath)
-		//panic("not implemented")
+		fmt.Printf("Uploading memfile to s3://%s/%s\n", t.s3.Name(),t.files.StorageMemfilePath())
 		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageMemfilePath())
 		object.UploadWithCli(ctx, memfilePath)
 	}
@@ -120,9 +117,8 @@ func (t *TemplateBuild) uploadRootfs(ctx context.Context, rootfsPath string) err
 
 	if consts.CloudProviderEnv == consts.AWS {
 		fmt.Printf("Uploading rootfs to s3: %s\n", t.s3.Name(),t.files.StorageRootfsPath())
-		//panic("not implemented")
 		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageRootfsPath())
-		object.UploadWithCli(ctx, t.files.StorageRootfsPath())
+		object.UploadWithCli(ctx, rootfsPath)
 	}
 
 	if consts.CloudProviderEnv == consts.GCP {
@@ -138,21 +134,21 @@ func (t *TemplateBuild) uploadRootfs(ctx context.Context, rootfsPath string) err
 }
 
 // Snapfile is small enough so we dont use composite upload.
-func (t *TemplateBuild) uploadSnapfile(ctx context.Context, snapfile io.Reader) error {
+func (t *TemplateBuild) uploadSnapfile(ctx context.Context, snapfilePath string) error {
 
 	if consts.CloudProviderEnv == consts.AWS {
 		fmt.Println("uploading snapfile to s3", t.files.StorageSnapfilePath())
-		//panic("not implemented")
+		
 		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageSnapfilePath())
-		object.UploadWithCli(ctx, t.files.StorageSnapfilePath())
+		object.UploadWithCli(ctx, snapfilePath)
 	}
 
 	if consts.CloudProviderEnv == consts.GCP {
 		object := gcs.NewObject(ctx, t.bucket, t.files.StorageSnapfilePath())
 
-		n, err := object.ReadFrom(snapfile)
+		err := object.UploadWithCli(ctx, snapfilePath)
 		if err != nil {
-			return fmt.Errorf("error when uploading snapfile (%d bytes): %w", n, err)
+			return fmt.Errorf("error when uploading rootfs: %w", err)
 		}
 	}
 
@@ -220,14 +216,19 @@ func (t *TemplateBuild) Upload(
 	})
 
 	eg.Go(func() error {
-		snapfile, err := os.Open(snapfilePath)
-		if err != nil {
-			return err
+
+		if snapfilePath == "" {
+			return nil
 		}
 
-		defer snapfile.Close()
+		// snapfile, err := os.Open(snapfilePath)
+		// if err != nil {
+		// 	return err
+		// }
 
-		err = t.uploadSnapfile(ctx, snapfile)
+		// defer snapfile.Close()
+
+		err := t.uploadSnapfile(ctx, snapfilePath)
 		if err != nil {
 			return err
 		}

@@ -137,7 +137,6 @@ func (r *Rootfs) pullDockerImage(ctx context.Context, tracer trace.Tracer) error
 			ServerAddress: fmt.Sprintf("https://%s.dkr.ecr.%s.amazonaws.com", accountID, consts.AWSRegion),
 		})
 
-		fmt.Println("authConfigBase64", authToken, authConfigBase64)
 	}
 	if consts.CloudProviderEnv == consts.GCP {
 		authConfigBase64, err = encodeAuthConfig(authConfig)
