@@ -74,7 +74,9 @@ func (t *TemplateBuild) uploadMemfile(ctx context.Context, memfilePath string) e
 
 	if consts.CloudProviderEnv == consts.AWS {
 		fmt.Println("uploading memfile to s3", memfilePath)
-		panic("not implemented")
+		//panic("not implemented")
+		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageMemfilePath())
+		object.UploadWithCli(ctx, memfilePath)
 	}
 
 	if consts.CloudProviderEnv == consts.GCP {

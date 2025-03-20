@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os/exec"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -376,4 +377,22 @@ func (o *Object) CopyFrom(ctx context.Context, srcBucket, srcObject string) erro
 	}
 
 	return err
+}
+
+func (o *Object) UploadWithCli(ctx context.Context, path string) error {
+	cmd := exec.CommandContext(
+		ctx,
+		"aws",
+		"s3",
+		"cp",
+		path,
+		fmt.Sprintf("s3://%s/%s", o.bucket, o.name),
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to upload file to S3: %w\n%s", err, string(output))
+	}
+
+	return nil
 }
