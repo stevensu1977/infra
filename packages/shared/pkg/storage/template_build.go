@@ -73,7 +73,7 @@ func (t *TemplateBuild) uploadMemfileHeader(ctx context.Context, h *header.Heade
 func (t *TemplateBuild) uploadMemfile(ctx context.Context, memfilePath string) error {
 
 	if consts.CloudProviderEnv == consts.AWS {
-		fmt.Println("uploading memfile to s3", memfilePath)
+		fmt.Printf("Uploading memfile to s3: %s\n", t.s3.Name(),memfilePath)
 		//panic("not implemented")
 		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageMemfilePath())
 		object.UploadWithCli(ctx, memfilePath)
@@ -94,9 +94,8 @@ func (t *TemplateBuild) uploadMemfile(ctx context.Context, memfilePath string) e
 func (t *TemplateBuild) uploadRootfsHeader(ctx context.Context, h *header.Header) error {
 
 	if consts.CloudProviderEnv == consts.AWS {
-		fmt.Println("uploading rootfsheader to s3", t.files.StorageRootfsHeaderPath())
-		//panic("not implemented")
-		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageMemfilePath())
+		fmt.Printf("Uploading rootfsheader to s3: %s\n", t.s3.Name(),t.files.StorageRootfsHeaderPath())
+		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageRootfsHeaderPath())
 		object.UploadWithCli(ctx, t.files.StorageRootfsHeaderPath())
 	}
 
@@ -120,7 +119,7 @@ func (t *TemplateBuild) uploadRootfsHeader(ctx context.Context, h *header.Header
 func (t *TemplateBuild) uploadRootfs(ctx context.Context, rootfsPath string) error {
 
 	if consts.CloudProviderEnv == consts.AWS {
-		fmt.Println("uploading rootfs to s3", t.files.StorageRootfsPath())
+		fmt.Printf("Uploading rootfs to s3: %s\n", t.s3.Name(),t.files.StorageRootfsPath())
 		//panic("not implemented")
 		object := s3.NewObject(t.s3.Client(), t.s3.Name(), t.files.StorageRootfsPath())
 		object.UploadWithCli(ctx, t.files.StorageRootfsPath())

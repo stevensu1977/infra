@@ -391,6 +391,7 @@ func (o *Object) UploadWithCli(ctx context.Context, path string) error {
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		fmt.Printf("Failed to upload file to S3: %s\n%s", err, string(output))
 		return fmt.Errorf("failed to upload file to S3: %w\n%s", err, string(output))
 	}
 

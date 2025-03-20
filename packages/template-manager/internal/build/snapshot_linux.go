@@ -358,8 +358,8 @@ func (s *Snapshot) configureFC(ctx context.Context, tracer trace.Tracer) error {
 		Smt:             &smt,
 		TrackDirtyPages: &trackDirtyPages,
 	}
-
-	if s.env.Hugepages() {
+	fmt.Println("hugepages", s.env.HugePages)
+	if s.env.HugePages==true {
 		machineConfig.HugePages = models.MachineConfigurationHugePagesNr2M
 	}
 

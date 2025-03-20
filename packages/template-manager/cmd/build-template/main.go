@@ -62,9 +62,11 @@ func Build(ctx context.Context, kernelVersion, fcVersion, templateID, buildID st
 		),
 		VCpuCount:       2,
 		MemoryMB:        1024,
+		HugePages:       false,
 		StartCmd:        "",
 		DiskSizeMB:      10240,
 		BuildLogsWriter: &buf,
+		
 	}
 
 	err = t.Build(ctx, tracer, dockerClient, legacyClient)

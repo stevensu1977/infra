@@ -36,6 +36,9 @@ type Env struct {
 
 	// Real size of the rootfs after building the env.
 	rootfsSize int64
+
+	// Whether to use hugepages for the VM.
+	HugePages bool
 }
 
 //go:embed provision.sh

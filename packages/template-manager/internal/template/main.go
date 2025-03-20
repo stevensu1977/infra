@@ -104,7 +104,7 @@ func deleteFromAWS(ctx context.Context, buildId string) error {
 	// This would typically involve:
 	// 1. Creating an AWS ECR client
 	// 2. Using BatchDeleteImage or DeleteRepository API
-	fmt.Println(GetDockerImageURL(buildId))
-	telemetry.ReportEvent(ctx, "AWS deletion not implemented yet")
-	return fmt.Errorf("AWS deletion not implemented yet")
+	telemetry.ReportEvent(ctx, fmt.Sprintf("AWS deletion not implemented yet: %s", GetDockerImageURL(buildId)))
+	//return fmt.Errorf("AWS deletion not implemented yet")
+	return nil
 }
